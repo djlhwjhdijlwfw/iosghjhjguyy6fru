@@ -39,6 +39,47 @@
 9:
 .endm
 
+/*
+ * Clean and invalidate [\lo, \hi) to the point of coherency, 64-byte lines.
+ * Works with the MMU off. Clobbers \lo.
+ */
+.macro civac_range lo, hi
+	bic	\lo, \lo, #63
+7:	dc	civac, \lo
+	add	\lo, \lo, #64
+	cmp	\lo, \hi
+	b.lo	7b
+	dsb	sy
+.endm
+
+/*
+ * Proof of life straight from assembly, before any memory use by the core:
+ * paint the left half of core \idx's 16-pixel bar at the bottom of the
+ * screen (y = 1350 + 24 * idx) and push it to memory. Clobbers x1-x6.
+ */
+.macro life_bar idx
+	mov	x1, #24
+	mul	x1, \idx, x1
+	add	x1, x1, #1350
+	mov	x2, #2880		/* FB_STRIDE */
+	mul	x1, x1, x2
+	movz	x2, #0xec00, lsl #16	/* FB_BASE */
+	add	x1, x1, x2
+	mov	x6, x1
+	movz	w4, #0xffff
+	movk	w4, #0xff00, lsl #16	/* cyan */
+	mov	x3, #16
+8:	mov	x5, x1
+	mov	x2, #360
+9:	str	w4, [x5], #4
+	subs	x2, x2, #1
+	b.ne	9b
+	add	x1, x1, #2880
+	subs	x3, x3, #1
+	b.ne	8b
+	civac_range x6, x1
+.endm
+
 	.section .text.head, "ax"
 	.globl _head
 _head:
@@ -59,6 +100,15 @@ _start:
 	msr	daifset, #0xf
 	mov	x19, x0			/* DTB pointer from S-BOOT */
 	el1_entry
+	/*
+	 * S-BOOT may leave parts of the image dirty in the caches: get it all
+	 * to memory now, while nothing of ours is written yet, so that cores
+	 * fetching with their caches off see the same code.
+	 */
+	adr	x1, _head
+	adrp	x2, _end
+	add	x2, x2, :lo12:_end
+	civac_range x1, x2
 	msr	spsel, #1
 	adr	x1, _stack_top
 	mov	sp, x1
@@ -72,7 +122,10 @@ _start:
 	b.hs	2f
 	str	xzr, [x1], #8
 	b	1b
-2:	mov	x0, x19
+2:	adr	x1, _bss_start		/* the zeroes too, in case data accesses are cached */
+	adr	x2, _bss_end
+	civac_range x1, x2
+	mov	x0, x19
 	mov	x1, x20			/* exception level we were entered at */
 	adr	x2, _head		/* where S-BOOT put us */
 	bl	shim_main
@@ -101,6 +154,7 @@ secondary_entry:
 	b.ne	6f
 	add	x1, x1, #4
 6:	and	x19, x1, #7
+	life_bar x19
 	msr	spsel, #1
 	adr	x1, _sec_stacks
 	add	x1, x1, x19, lsl #12

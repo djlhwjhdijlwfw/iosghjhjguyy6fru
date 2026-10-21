@@ -64,6 +64,18 @@
 #define isb() __asm__ volatile("isb" ::: "memory")
 #define dsb() __asm__ volatile("dsb sy" ::: "memory")
 
+/*
+ * If data accesses with the MMU off end up cached (a hypervisor's
+ * HCR_EL2.DC), cores do not see each other's writes: push and refetch the
+ * shared reports by hand. Harmless when they really are Device accesses.
+ */
+static void civac(volatile const void *p, uint64_t len)
+{
+	for (uintptr_t a = (uintptr_t)p & ~63UL; a < (uintptr_t)p + len; a += 64)
+		__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
 static inline uint32_t rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
 static inline void wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
 static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
@@ -98,7 +110,7 @@ struct cpu_report {
 	uint64_t arrived, ctx, done, midr, mpidr, mmfr0, mmfr1, isar0, isar1, el;
 	uint64_t ticks, cycles, probing, faulted;
 	uint64_t crashed, esr, elr, far;
-};
+} __attribute__((aligned(64)));	/* one core's lines are its own */
 static volatile struct cpu_report rep[NR_CPUS];
 static uint64_t boot_mpidr;
 
@@ -269,7 +281,7 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 		me->far = rsr("far_el1");
 		dsb();
 		me->crashed = 1;
-		dsb();
+		civac(me, sizeof(*me));
 		for (;;)
 			__asm__ volatile("wfi");
 	}
@@ -341,6 +353,16 @@ static void report_self(int idx, uint64_t el)
 	dsb();
 }
 
+/* Pixels x0..x1 of core idx's life bar; start.S paints 0..359 on entry. */
+static void life_bar(int idx, int x0, int x1, uint32_t color)
+{
+	uintptr_t row = FB_BASE + (uintptr_t)(1350 + 24 * idx) * FB_STRIDE;
+	for (int y = 0; y < 16; y++)
+		for (int x = x0; x < x1; x++)
+			wr32(row + y * FB_STRIDE + x * 4, color);
+	civac((void *)row, 16 * FB_STRIDE);
+}
+
 /* idx comes from MPIDR (start.S); ctx is x0 as PSCI CPU_ON delivered it */
 void secondary_main(uint64_t idx, uint64_t el, uint64_t ctx)
 {
@@ -349,8 +371,10 @@ void secondary_main(uint64_t idx, uint64_t el, uint64_t ctx)
 	c->ctx = ctx;
 	dsb();
 	c->arrived = 1;
-	dsb();
+	civac(c, sizeof(*c));
 	report_self(idx & (NR_CPUS - 1), el);
+	civac(c, sizeof(*c));
+	life_bar(idx & (NR_CPUS - 1), 360, FB_W, GREEN);
 	smc(PSCI_CPU_OFF, 0, 0, 0);
 	for (;;)
 		__asm__ volatile("wfi");
@@ -441,8 +465,11 @@ static void test_smp(int self_idx)
 	/* every core runs its speed loop before it reports: give the slow ones time */
 	for (int t = 0; t < 50; t++) {
 		int all = 1;
-		for (int i = 0; i < NR_CPUS; i++)
+		for (int i = 0; i < NR_CPUS; i++) {
+			if (i != self_idx)
+				civac(&rep[i], sizeof(rep[i]));
 			all &= rep[i].done || rep[i].crashed;
+		}
 		if (all)
 			break;
 		delay_ms(100);
@@ -471,6 +498,8 @@ static void test_smp(int self_idx)
 	if (ctx_ok + ctx_bad)
 		con_strc("PSCI", ctx_bad ? "x0 is NOT the context id: use MPIDR" :
 					   "x0 = context id, as asked", ctx_bad ? YELLOW : GREEN);
+	con_str("BARS", "bottom: C100-C103, C200-C201, C000-1");
+	con_str("", "cyan half: entered, green: reported");
 	con_skip();
 	if (a73 < 0)
 		con_strc("VERDICT", "no A73 answered: see CPU_ON codes", YELLOW);
@@ -563,7 +592,7 @@ void shim_main(uint64_t dtb, uint64_t el, uint64_t image)
 
 	stage = "start";
 	con_clear(RED);
-	con_str("SHIM", "a30s milestone 1b: diagnostics");
+	con_str("SHIM", "a30s milestone 1c: diagnostics");
 	con_hex2("ENTRY", "el=", el, "cntfrq=", rsr("cntfrq_el0"));
 	con_hex("IMAGE", image);
 	con_hex("X0 DTB", dtb);
@@ -590,6 +619,7 @@ void shim_main(uint64_t dtb, uint64_t el, uint64_t image)
 	if (self_idx >= 0) {
 		rep[self_idx].arrived = 1;
 		report_self(self_idx, el);
+		life_bar(self_idx, 0, FB_W, WHITE);	/* the boot core's bar: where they go */
 	}
 	test_smp(self_idx);
 	con_skip();
