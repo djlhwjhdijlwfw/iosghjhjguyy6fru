@@ -32,6 +32,8 @@ GICC, GICC_SIZE = 0x12302000, 0x2000
 FB, FB_SIZE = 0xec000000, 0x1400000
 SWEET_ECID = 0x4133305300000001  # 'A30S' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 720, 1560, 720 * 4
+# dwmmc0 (mmc@13500000): the eMMC S-BOOT boots from, with the SMU (FMP) block
+MMC, MMC_SIZE = 0x13500000, 0x2000
 # arm,armv8-timer: CNTFRQ is 26 MHz (OSCCLK); the virtual timer is PPI 11
 TIMEBASE = 26000000
 VTIMER_INTID = 27
@@ -199,7 +201,13 @@ def build(seed=None, qemu=False):
         ('stride', u32(FB_STRIDE)),
     ])
 
-    # No "sweet-ufs" node: the A30s has eMMC (a DW-MMC driver comes later).
+    # bsd/dev/sweet_ufs.c, eMMC transport: the DesignWare MMC host S-BOOT
+    # leaves running (absolute physical reg). QEMU virt has none.
+    mmc = node('sweet-mmc', [
+        ph(),
+        ('compatible', cstr('samsung,exynos7-dw-mshc-smu')),
+        ('reg', u64(MMC, MMC_SIZE)),
+    ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -237,7 +245,7 @@ def build(seed=None, qemu=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product)
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [mmc]))
 
 
 if __name__ == '__main__':
