@@ -36,4 +36,6 @@ blocks=$((bytes / 4096))
 skip=$((blocks - 1025))
 "$ADB" exec-out "dd if=$NODE bs=4096 skip=$skip count=1025 2>/dev/null" > "$out.bin"
 echo "$NODE: $bytes bytes, read blocks $skip..$((blocks - 1)) ($(wc -c < "$out.bin") bytes)" >&2
-"$PYTHON" "$HERE/tools/sweet-log.py" "$out.bin" "$out"
+# Git Bash runs the Windows python: it needs Windows paths
+pypath() { if command -v cygpath > /dev/null 2>&1; then cygpath -w "$1"; else printf '%s\n' "$1"; fi; }
+"$PYTHON" "$(pypath "$HERE/tools/sweet-log.py")" "$(pypath "$out.bin")" "$(pypath "$out")"
