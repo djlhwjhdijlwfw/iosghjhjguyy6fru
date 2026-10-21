@@ -24,6 +24,6 @@ fi
 python3 "$HERE/tools/mkadt.py" "$W/qemu.adt" --qemu
 python3 "$HERE/tools/mkpayload.py" "$KERNEL" "$W/qemu.adt" "$W/payload.bin" --cmdline "$ARGS" > /dev/null
 rm -rf "$W/run"
-python3 "$HERE/tools/qemu-sweet.py" "$W/payload.bin" "$W/run" --gic 2 --secs "$SECS" || true
+python3 "$HERE/tools/qemu-sweet.py" "$W/payload.bin" "$W/run" --gic 2 --smp ${SMP:-2} --secs "$SECS" || true
 grep -c 'Taking exception' "$W/run/qemu.log" | sed 's/^/exceptions: /' || true
 echo "screen: $W/run/fb.png"
