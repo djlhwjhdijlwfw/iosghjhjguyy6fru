@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6f29fba..c838bab 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -305,9 +305,20 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+-	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+-	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++	/*
++	 * The Qualcomm MDP (VIG0, CTL0, INTF1) and DSI0 below are topaz's; on
++	 * another SoC (a30s: Exynos 7904) these addresses are not the display
++	 * and touching them may abort. sweetmdp=1 maps them. Without them the
++	 * frames are copied into the boot framebuffer (boot_args.Video), there
++	 * is no direct scanout and no panel brightness or power control.
++	 */
++	uint32_t mdpOn = 0;
++	(void)PE_parse_boot_argn("sweetmdp", &mdpOn, sizeof(mdpOn));
++	if (mdpOn) {
++		fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
++		fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++		fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++	}
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+@@ -350,7 +361,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	OSSafeReleaseNULL(accel);
+ 	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
+-	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
++	fIntf1 = mdpOn ? (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000) : NULL;
+ 	if (fIntf1 != NULL) {
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */

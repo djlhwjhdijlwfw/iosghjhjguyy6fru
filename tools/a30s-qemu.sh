@@ -13,7 +13,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 KERNEL=$(realpath "${1:?kernel Mach-O}")
 SECS=${2:-60}
-ARGS=${3:-debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1}
+ARGS=${3:-debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 sweetbattery=0 sweetcpufreq=0}
 W=$HOME/q/a30s
 mkdir -p "$W"
 if [ -z "${QEMU:-}" ]; then
