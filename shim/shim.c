@@ -1,81 +1,95 @@
 /*
- * Milestone 2: one boot answers the questions that decide the XNU port.
- *   - CPU feature registers (16K granule, GIC sysreg interface)
- *   - PSCI/SMCCC version and which PSCI calls the Qualcomm TZ offers
- *   - SMP: PSCI CPU_ON for the 7 secondaries, each reports its MPIDR
- *   - GICv3 Group 1 IRQ from the virtual timer (INTID 19 on Qualcomm)
- * Any unexpected exception paints a blue panic screen.
+ * a30s milestone 1: one boot answers the questions that decide the XNU port
+ * on the Galaxy A30s (Exynos 7904), before any kernel work:
+ *   - which exception level S-BOOT enters at, where it puts us, the DTB
+ *   - per core (2x Cortex-A73, 6x Cortex-A53, each woken by PSCI CPU_ON):
+ *     the 16K translation granule (xnu needs it), LSE atomics, RCpc, PAN,
+ *     and a rough clock
+ *   - the GIC-400 (GICv2): virtual timer PPI 27 and a self-SGI as Group 1
+ *     IRQs, the way xnu will have to take them
+ *   - the keys on GPA1 and how long the phone stays up (watchdog)
+ * Results stay on screen. Volume Up held for a second restarts into TWRP,
+ * Volume Down into download mode; any exception paints a blue panic screen
+ * and waits for the same keys.
  */
 #include <stdint.h>
 #include "console.h"
-#include "mmu.h"
-#include "loader.h"
-#include "ufs.h"
+#include "fdt.h"
 
-#define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
-#define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0440b000UL
+/* Exynos 7885 / 7904 */
+#define DECON_F_BASE		0x14860000UL
+#define HW_SW_TRIG_CONTROL	0x70
+#define PMU_BASE		0x11c80000UL
+#define PMU_SWRESET		(PMU_BASE + 0x400)	/* bit 0, syscon-reboot */
+#define PMU_INFORM2		(PMU_BASE + 0x808)
+#define PMU_INFORM3		(PMU_BASE + 0x80c)
+#define INFORM2_REBOOT		0x12345678U	/* Samsung sec_reboot: a software reset */
+#define INFORM3_RECOVERY	0x12345674U
+#define INFORM3_DOWNLOAD	0x12345671U
+#define GPA1_CON		0x11cb0060UL	/* pinctrl alive: etc0, etc1, gpa0, gpa1 */
+#define GPA1_DAT		0x11cb0064UL
+#define KEY_VOLUP		(1U << 5)	/* active low */
+#define KEY_VOLDOWN		(1U << 6)
+#define KEY_POWER		(1U << 7)
 
-#define GICD_BASE		0x0f200000UL
-#define GICR_BASE		0x0f300000UL
-#define GICR_SIZE		0x100000UL
-#define GICR_PE_SIZE		0x20000UL
-#define GICR_TYPER		0x08
-#define GICR_WAKER		0x14
-#define GICR_SGI		0x10000
-#define GICR_IGROUPR0		(GICR_SGI + 0x080)
-#define GICR_ISENABLER0		(GICR_SGI + 0x100)
-#define GICR_ICENABLER0		(GICR_SGI + 0x180)
-#define GICR_IPRIORITYR		(GICR_SGI + 0x400)
-#define GICR_ISPENDR0		(GICR_SGI + 0x200)
-#define GICR_ISACTIVER0		(GICR_SGI + 0x300)
-#define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
+#define GICD_BASE		0x12301000UL
+#define GICC_BASE		0x12302000UL
+#define GICD_CTLR		0x000
+#define GICD_TYPER		0x004
+#define GICD_IIDR		0x008
+#define GICD_ISENABLER		0x100
+#define GICD_ICENABLER		0x180
+#define GICD_ICPENDR		0x280
+#define GICD_IPRIORITYR		0x400
+#define GICD_SGIR		0xf00
+#define GICD_PIDR2		0xfe8
+#define GICC_CTLR		0x000
+#define GICC_PMR		0x004
+#define GICC_BPR		0x008
+#define GICC_IAR		0x00c
+#define GICC_EOIR		0x010
+#define GICC_IIDR		0x0fc
+#define VTIMER_INTID		27	/* DT: <GIC_PPI 11 ...> */
 #define SGI_INTID		1
 
-#define PSCI_VERSION		0x84000000UL
-#define PSCI_CPU_SUSPEND	0xc4000001UL
+/* PSCI 0.1: only the function IDs the DT names */
 #define PSCI_CPU_OFF		0x84000002UL
 #define PSCI_CPU_ON		0xc4000003UL
-#define PSCI_MIGRATE_INFO_TYPE	0x84000006UL
-#define PSCI_SYSTEM_RESET	0x84000009UL
-#define PSCI_FEATURES		0x8400000aUL
-#define PSCI_SYSTEM_SUSPEND	0xc400000eUL
-#define PSCI_SYSTEM_RESET2	0xc4000012UL
-#define SMCCC_VERSION		0x80000000UL
 
 #define NR_CPUS			8
+#define SPEED_LOOPS		2000000UL
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
 #define isb() __asm__ volatile("isb" ::: "memory")
+#define dsb() __asm__ volatile("dsb sy" ::: "memory")
 
 static inline uint32_t rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
-static inline uint64_t rd64(uintptr_t a) { return *(volatile uint64_t *)a; }
 static inline void wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
 static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
-/* topaz: CPU0-3 (A53) at MPIDR 0x0-0x3, CPU4-7 (A73) at 0x100-0x103 */
-static inline uint64_t cpu_mpidr(int i) { return (uint64_t)(i >> 2) << 8 | (i & 3); }
 
-static volatile uint64_t sec_mpidr[NR_CPUS];
-static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
+/* a30s: CPU0-5 are the A53s at 0x100-0x103 and 0x200-0x201, CPU6-7 the A73s at 0x0-0x1 */
+static uint64_t cpu_mpidr(int i)
+{
+	if (i < 4)
+		return 0x100 | i;
+	if (i < 6)
+		return 0x200 | (i - 4);
+	return i - 6;
+}
+
+/* What each core found about itself; written with the MMU (and so caches) off. */
+struct cpu_report {
+	uint64_t done, midr, mpidr, mmfr0, mmfr1, isar0, isar1, el, ticks;
+};
+static volatile struct cpu_report rep[NR_CPUS];
+
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
-
-/* ICC_SGI1R_EL1 value targeting the calling core only. */
-static uint64_t sgi_self(unsigned id)
-{
-	uint64_t m = rsr("mpidr_el1");
-	return ((m >> 16) & 0xff) << 32 |	/* Aff2 */
-	       ((m >> 8) & 0xff) << 16 |	/* Aff1 */
-	       (uint64_t)id << 24 |
-	       (1U << (m & 0xf));		/* target list: Aff0 */
-}
 
 static uint64_t smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
 {
@@ -104,27 +118,112 @@ static void delay_ms(unsigned ms)
 		;
 }
 
-static void __attribute__((noreturn)) reset(unsigned after_s)
+/* ---- one line of text, built up piece by piece ---- */
+
+struct line {
+	char b[48];
+	int n;
+};
+
+static void lstart(struct line *l)
 {
-	con_skip();
-	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
-	delay_ms(after_s * 1000);
-	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
-	__asm__ volatile("dsb sy" ::: "memory");
-	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
-	wr32(PSHOLD, 0);
+	l->n = 0;
+	l->b[0] = 0;
+}
+
+static void ls(struct line *l, const char *s)
+{
+	while (*s && l->n < (int)sizeof(l->b) - 1)
+		l->b[l->n++] = *s++;
+	l->b[l->n] = 0;
+}
+
+static void lx(struct line *l, uint64_t v, int digits)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	char buf[17];
+	for (int i = 0; i < digits; i++)
+		buf[i] = hex[(v >> (4 * (digits - 1 - i))) & 0xf];
+	buf[digits] = 0;
+	ls(l, buf);
+}
+
+static void ld(struct line *l, uint64_t v)
+{
+	char buf[21];
+	int i = 20;
+	buf[i] = 0;
+	do
+		buf[--i] = '0' + v % 10;
+	while (v /= 10);
+	ls(l, buf + i);
+}
+
+/* ---- restart, keys ---- */
+
+static void __attribute__((noreturn)) restart_into(uint32_t inform3)
+{
+	wr32(PMU_INFORM2, INFORM2_REBOOT);
+	wr32(PMU_INFORM3, inform3);
+	dsb();
+	wr32(PMU_SWRESET, rd32(PMU_SWRESET) | 1);
 	for (;;)
 		__asm__ volatile("wfe");
+}
+
+/*
+ * Redraw the uptime and key state every 100 ms forever. A key held for a
+ * second restarts: Volume Up into TWRP, Volume Down into download mode.
+ */
+static void __attribute__((noreturn)) key_loop(void)
+{
+	int r = con_row();
+	uint64_t f = rsr("cntfrq_el0"), t0 = now(), held_since = 0;
+	uint32_t held = 0;
+
+	con_set_row(r + 3);
+	con_str("VOL+", "hold 1s: restart into TWRP");
+	con_str("VOL-", "hold 1s: restart into download mode");
+	for (;;) {
+		uint32_t dat = rd32(GPA1_DAT);
+		uint32_t down = ~dat & (KEY_VOLUP | KEY_VOLDOWN | KEY_POWER);
+		struct line l;
+
+		con_set_row(r);
+		lstart(&l);
+		ld(&l, (now() - t0) / f);
+		ls(&l, " s since the results    ");
+		con_str("UPTIME", l.b);
+		lstart(&l);
+		ls(&l, "dat=");
+		lx(&l, dat & 0xff, 2);
+		ls(&l, down & KEY_VOLUP ? " VOL+" : "     ");
+		ls(&l, down & KEY_VOLDOWN ? " VOL-" : "     ");
+		ls(&l, down & KEY_POWER ? " POWER" : "      ");
+		con_str("KEYS", l.b);
+
+		uint32_t k = down & (KEY_VOLUP | KEY_VOLDOWN);
+		if (k != held) {
+			held = k;
+			held_since = now();
+		} else if (k && now() - held_since > f) {
+			con_set_row(r + 6);
+			con_strc("RESTART", k & KEY_VOLUP ? "into TWRP" : "into download mode", GREEN);
+			delay_ms(300);
+			restart_into(k & KEY_VOLUP ? INFORM3_RECOVERY : INFORM3_DOWNLOAD);
+		}
+		delay_ms(100);
+	}
 }
 
 /* ---- exceptions ---- */
 
 static void irq_handler(void)
 {
-	uint64_t iar = rsr("icc_iar1_el1");
-	uint32_t id = iar & 0xffffff;
+	uint32_t iar = rd32(GICC_BASE + GICC_IAR);
+	uint32_t id = iar & 0x3ff;
 
-	if (id >= 1020 && id <= 1023)
+	if (id >= 1020)
 		return;	/* spurious */
 	irq_last = id;
 	if (id == (uint32_t)irq_src)
@@ -133,10 +232,7 @@ static void irq_handler(void)
 		irq_other++;
 	if (id == VTIMER_INTID)
 		wsr("cntv_tval_el0", rsr("cntfrq_el0") / 100);	/* 10 ms */
-	else if (id == PTIMER_INTID)
-		wsr("cntp_tval_el0", rsr("cntfrq_el0") / 100);
-	wsr("icc_eoir1_el1", iar);
-	isb();
+	wr32(GICC_BASE + GICC_EOIR, iar);
 }
 
 void exc_handler(uint64_t slot, uint64_t *regs)
@@ -161,424 +257,258 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_hex("X0", regs[0]);
 	con_hex("X1", regs[1]);
 	con_hex("X30", regs[29]);	/* stashed lr is just above the frame */
-	reset(40);
+	con_skip();
+	key_loop();
 }
 
-/* ---- SMP ---- */
+/* ---- cores ---- */
 
-static uintptr_t find_gicr(void);
-
-/*
- * topaz: xnu needs the 16K translation granule. ABL starts us on a Kryo 260
- * Silver core (Cortex-A53 class, TGran16 = 0); the Gold A73 cluster has it.
- * The boot core wakes gold CPU 0x100 with this DTB and parks itself; gold
- * runs the loader and xnu never sees the silver cluster.
- */
-static volatile uint64_t gold_dtb;
-static void test_gic(void);
-
-/*
- * xnu starts the other gold CPUs itself (PSCI CPU_ON), without the shim, so
- * give their redistributors the same setup test_gic() gives the boot CPU:
- * awake, SGIs/PPIs in Group 1, default priority. The frames are MMIO, so the
- * boot CPU can do it for all of them.
- */
-static void gold_gicr_prepare(void)
-{
-	for (uint32_t aff = 0x101; aff <= 0x103; aff++) {
-		uintptr_t r = 0;
-		for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
-			uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
-			if ((uint32_t)(typer >> 32) == aff) {
-				r = GICR_BASE + off;
-				break;
-			}
-			if (typer & (1 << 4))	/* Last */
-				break;
-		}
-		if (!r) {
-			con_hex("GICR miss", aff);
-			continue;
-		}
-		uint32_t waker = rd32(r + GICR_WAKER);
-		if (waker & 2) {
-			wr32(r + GICR_WAKER, waker & ~2U);
-			for (int i = 0; i < 100000 && (rd32(r + GICR_WAKER) & 4); i++)
-				;
-		}
-		wr32(r + GICR_IGROUPR0, 0xffffffff);
-		for (int id = 0; id < 32; id++)
-			wr8(r + GICR_IPRIORITYR + id, 0xa0);
-		/*
-		 * Also enable the timers and SGI1, as test_gic() does on the boot
-		 * CPU: without it a thread whose wakeup timer is armed on a
-		 * secondary never wakes (backboardd stuck in usleep()).
-		 */
-		wr32(r + GICR_ISENABLER0, (1U << VTIMER_INTID) | (1U << PTIMER_INTID) | (1U << SGI_INTID));
-		con_hex2("GICR+", "aff=", aff, "en=", rd32(r + GICR_ISENABLER0));
-	}
-}
-
-/*
- * Core speed probe: ticks (19.2 MHz) for a fixed dependent-add loop with the
- * I-cache on. Silver runs at whatever ABL set; gold has no cpufreq driver
- * after PSCI CPU_ON, so a much larger count than silver means a low clock.
- */
-static volatile uint64_t silver_ticks;
-
+/* Timer ticks for a fixed count of one-cycle loop iterations, I-cache on. */
 static uint64_t speed_ticks(void)
 {
-	uint64_t sctlr = rsr("sctlr_el1");
+	uint64_t sctlr = rsr("sctlr_el1"), n = SPEED_LOOPS;
 	wsr("sctlr_el1", sctlr | (1UL << 12));	/* I-cache on (fine with MMU off) */
-	__asm__ volatile("isb");
-	uint64_t t = now(), x = 0;
-	for (uint64_t i = 0; i < 20000000; i++)
-		__asm__ volatile("add %0, %0, #1" : "+r"(x));
+	isb();
+	uint64_t t = now();
+	__asm__ volatile("1: subs %0, %0, #1\n\tb.ne 1b" : "+r"(n));
 	t = now() - t;
 	wsr("sctlr_el1", sctlr);
-	__asm__ volatile("isb");
+	isb();
 	return t;
 }
 
-/*
- * Gold cluster to its top cpufreq-hw level before xnu (which has no cpufreq
- * driver): freq-domain1 0xf523000, LUT +0x110 (32-byte rows), PERF_STATE +0x920.
- */
-static void gold_cpufreq_max(void)
+static void report_self(int idx, uint64_t el)
 {
-	uintptr_t b = 0x0f523000;
-	uint32_t best = 0, best_khz = 0, prev = 0;
-	for (uint32_t i = 0; i < 12; i++) {
-		uint32_t v = rd32(b + 0x110 + i * 0x20);
-		uint32_t khz = ((v >> 30) & 3) ? 19200 * (v & 0xff) : 300000;
-		if (i && khz == prev)
-			break;
-		prev = khz;
-		if (khz > best_khz) {
-			best_khz = khz;
-			best = i;
-		}
-	}
-	uint32_t old = rd32(b + 0x920);
-	wr32(b + 0x920, best);
-	__asm__ volatile("dsb sy" ::: "memory");
-	con_hex2("CPUFREQ", "old=", old, "mhz=", best_khz / 1000);
+	volatile struct cpu_report *c = &rep[idx];
+	c->midr = rsr("midr_el1");
+	c->mpidr = rsr("mpidr_el1");
+	c->mmfr0 = rsr("id_aa64mmfr0_el1");
+	c->mmfr1 = rsr("id_aa64mmfr1_el1");
+	c->isar0 = rsr("id_aa64isar0_el1");
+	c->isar1 = rsr("id_aa64isar1_el1");
+	c->el = el;
+	c->ticks = speed_ticks();
+	dsb();
+	c->done = 1;
+	dsb();
 }
 
-static void __attribute__((noreturn)) gold_main(uint64_t dtb)
+void secondary_main(uint64_t idx, uint64_t el)
 {
-	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
-
-	con_hex2("GOLD", "midr=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
-	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
-	con_skip();
-	if (((mmfr0 >> 20) & 0xf) == 0)
-		con_str("GOLD", "no 16K granule here either");
-	else {
-		/*
-		 * Required: without it xnu hangs after initCPU on gold (no SGI or
-		 * vtimer). It sets GICD EnableGrp1/ARE_NS, wakes gold's redistributor
-		 * and puts its SGIs/PPIs in Group 1; which part matters is still to
-		 * be narrowed down.
-		 */
-		test_gic();
-		gold_gicr_prepare();
-		gold_cpufreq_max();
-		uint64_t gt = speed_ticks();
-		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
-		delay_ms(1000);
-		con_skip();
-		con_str("LOADER", loader_boot(dtb));
-	}
-	for (;;)
-		__asm__ volatile("wfe");
-}
-
-void secondary_main(uint64_t idx)
-{
-	if (gold_dtb)
-		gold_main(gold_dtb);
-	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
-	if (idx == 1) {
-		uintptr_t r = find_gicr();
-		if (r) {
-			sec_probe[0] = rd32(r + GICR_IGROUPR0);
-			wr32(r + GICR_IGROUPR0, 0xffffffff);
-			sec_probe[1] = rd32(r + GICR_IGROUPR0);
-			wr8(r + GICR_IPRIORITYR + 19, 0xa0);
-			sec_probe[2] = rd32(r + GICR_IPRIORITYR + 16);
-		}
-		sec_probe[3] = r ? 1 : 0xdead;
-	}
-	__asm__ volatile("dsb sy" ::: "memory");
+	if (idx < NR_CPUS)
+		report_self(idx, el);
 	smc(PSCI_CPU_OFF, 0, 0, 0);
+	for (;;)
+		__asm__ volatile("wfi");
 }
 
-static void __attribute__((unused)) test_smp(void)
+static int field(uint64_t reg, int shift)
 {
-	stage = "smp";
-	uint64_t self = rsr("mpidr_el1") & 0xffffff;
-	int64_t ret[NR_CPUS];
+	return (reg >> shift) & 0xf;
+}
 
-	for (int i = 1; i < NR_CPUS; i++)
-		ret[i] = smc(PSCI_CPU_ON, cpu_mpidr(i), (uintptr_t)secondary_entry, i);
-	delay_ms(500);
-	for (int i = 1; i < NR_CPUS; i++) {
-		char label[] = "CPU0";
-		label[3] = '0' + i;
-		if (cpu_mpidr(i) == self)
-			con_str(label, "is boot cpu");
-		else
-			con_hex2(label, "ret=", (uint32_t)ret[i], "mpidr=",
-				 (uint32_t)sec_mpidr[i] | (sec_mpidr[i] ? 0 : 0xdead0000));
+/* "C100  A53 midr=410FD034 16K:no  ~1586MHz"; the other features below */
+static void show_cpu(int i, int64_t ret, uint64_t f)
+{
+	volatile struct cpu_report *c = &rep[i];
+	struct line l;
+	char label[] = "C000";
+
+	lstart(&l);
+	label[1] = '0' + ((cpu_mpidr(i) >> 8) & 0xf);
+	label[3] = '0' + (cpu_mpidr(i) & 0xf);
+	if (!c->done) {
+		ls(&l, "no answer, CPU_ON=");
+		lx(&l, (uint64_t)ret, 8);
+		con_strc(label, l.b, YELLOW);
+		return;
 	}
+	uint32_t part = (c->midr >> 4) & 0xfff;
+	ls(&l, part == 0xd09 ? "A73 " : part == 0xd03 ? "A53 " : "??? ");
+	ls(&l, "midr=");
+	lx(&l, (uint32_t)c->midr, 8);
+	ls(&l, field(c->mmfr0, 20) ? " 16K:YES " : " 16K:no  ");
+	ls(&l, "~");
+	ld(&l, c->ticks ? SPEED_LOOPS * f / c->ticks / 1000000 : 0);
+	ls(&l, "MHz");
+	con_strc(label, l.b, field(c->mmfr0, 20) ? GREEN : WHITE);
 }
 
-/* ---- GIC + timer ---- */
-
-static uintptr_t find_gicr(void)
+static void show_features(const char *label, int i)
 {
-	uint64_t aff = rsr("mpidr_el1");
-	uint32_t want = (aff & 0xffffff) | ((aff >> 8) & 0xff000000);
+	volatile struct cpu_report *c = &rep[i];
+	struct line l;
 
-	for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
-		uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
-		if ((uint32_t)(typer >> 32) == want)
-			return GICR_BASE + off;
-		if (typer & (1 << 4))	/* Last */
-			break;
-	}
-	return 0;
+	lstart(&l);
+	ls(&l, "EL");
+	ld(&l, c->el);
+	ls(&l, " lse=");
+	ld(&l, field(c->isar0, 20));
+	ls(&l, " rcpc=");
+	ld(&l, field(c->isar1, 20));
+	ls(&l, " pan=");
+	ld(&l, field(c->mmfr1, 20));
+	ls(&l, " m0=");
+	lx(&l, (uint32_t)c->mmfr0, 8);
+	con_str(label, l.b);
 }
 
-static void gicd_wait_rwp(void)
-{
-	for (int i = 0; i < 1000000 && (rd32(GICD_BASE) & (1U << 31)); i++)
-		;
-}
-
-/* Run one interrupt source for ~300 ms and report what the GIC saw. */
-static void irq_window(const char *label, uintptr_t r, int src)
+static void test_smp(int self_idx)
 {
 	uint64_t f = rsr("cntfrq_el0");
-	uint32_t pend = 0, act = 0, isr = 0, hppi = 0x3ff, ist = 0;
+	int64_t ret[NR_CPUS];
 
+	stage = "smp";
+	for (int i = 0; i < NR_CPUS; i++)
+		ret[i] = i == self_idx ? 0 :
+			 (int64_t)smc(PSCI_CPU_ON, cpu_mpidr(i), (uintptr_t)secondary_entry, i);
+	/* every core runs its speed loop before it reports: give the slow ones time */
+	for (int t = 0; t < 30; t++) {
+		int all = 1;
+		for (int i = 0; i < NR_CPUS; i++)
+			all &= rep[i].done != 0;
+		if (all)
+			break;
+		delay_ms(100);
+	}
+
+	int a73 = -1, a53 = -1;
+	for (int i = 0; i < NR_CPUS; i++) {
+		show_cpu(i, ret[i], f);
+		uint32_t part = (rep[i].midr >> 4) & 0xfff;
+		if (rep[i].done && part == 0xd09 && a73 < 0)
+			a73 = i;
+		if (rep[i].done && part == 0xd03 && a53 < 0)
+			a53 = i;
+	}
+	if (a73 >= 0)
+		show_features("A73", a73);
+	if (a53 >= 0)
+		show_features("A53", a53);
+
+	con_skip();
+	if (a73 < 0)
+		con_strc("VERDICT", "no A73 answered: see CPU_ON codes", YELLOW);
+	else if (field(rep[a73].mmfr0, 20))
+		con_strc("VERDICT", "A73 has 16K pages: XNU can run there", GREEN);
+	else
+		con_strc("VERDICT", "A73 has NO 16K pages: 4K XNU needed", YELLOW);
+}
+
+/* ---- GIC-400 (GICv2) + timer ---- */
+
+/* Run one interrupt source for ~300 ms and report what the GIC delivered. */
+static void irq_window(const char *label, int src)
+{
+	uint64_t f = rsr("cntfrq_el0");
+	struct line l;
+
+	lstart(&l);
 	irq_count = irq_other = 0;
 	irq_last = 0x3ff;
 	irq_src = src;
 	if (src == VTIMER_INTID) {
 		wsr("cntv_tval_el0", f / 100);
 		wsr("cntv_ctl_el0", 1);
-	} else if (src == PTIMER_INTID) {
-		wsr("cntp_tval_el0", f / 100);
-		wsr("cntp_ctl_el0", 1);
 	}
 	isb();
-	/* sample state with IRQs still masked, after the first period */
-	uint64_t t = now() + f / 50;
-	while (now() < t)
-		;
-	if (src == SGI_INTID)
-		wsr("icc_sgi1r_el1", sgi_self(SGI_INTID));
-	isb();
-	ist = src == PTIMER_INTID ? rsr("cntp_ctl_el0") : rsr("cntv_ctl_el0");
-	pend = rd32(r + GICR_ISPENDR0);
-	act = rd32(r + GICR_ISACTIVER0);
-	isr = rsr("isr_el1");
-	hppi = rsr("icc_hppir1_el1");
-
 	__asm__ volatile("msr daifclr, #2" ::: "memory");
-	t = now() + f * 3 / 10;
-	/* SGI: one already sent above, send 9 more 10 ms apart -> expect 10 */
-	uint64_t next = now() + f / 100;
-	for (int sent = 1; now() < t;)
+	uint64_t t = now() + f * 3 / 10, next = now();
+	/* SGI: send 10, 10 ms apart -> expect 10; NSATT so a Group 1 SGI goes out */
+	for (int sent = 0; now() < t;)
 		if (src == SGI_INTID && sent < 10 && now() >= next) {
-			wsr("icc_sgi1r_el1", sgi_self(SGI_INTID));
-			isb();
+			wr32(GICD_BASE + GICD_SGIR, (2U << 24) | (1U << 15) | SGI_INTID);
 			sent++;
 			next += f / 100;
 		}
 	__asm__ volatile("msr daifset, #2" ::: "memory");
 	wsr("cntv_ctl_el0", 0);
-	wsr("cntp_ctl_el0", 0);
 	isb();
 
-	con_hex2(label, "irqs=", irq_count, "other=", irq_other);
-	con_hex2(" pre", "pend=", pend, "act=", act);
-	con_hex2(" pre", "isr=", isr, "hppi=", hppi);
-	con_hex2(" pre", "tctl=", ist, "last=", irq_last);
+	ls(&l, "irqs=");
+	ld(&l, irq_count);
+	ls(&l, " other=");
+	ld(&l, irq_other);
+	ls(&l, " last=");
+	ld(&l, irq_last);
+	con_strc(label, l.b, irq_count ? GREEN : YELLOW);
 }
 
 static void test_gic(void)
 {
-	stage = "gic sre";
-	uint64_t sre = rsr("icc_sre_el1");
-	if (!(sre & 1)) {
-		wsr("icc_sre_el1", sre | 1);
-		isb();
-	}
-	if (!(rsr("icc_sre_el1") & 1)) {
-		con_str("GIC", "no sysreg iface, skip");
-		return;
-	}
+	stage = "gic regs";
+	uint32_t typer = rd32(GICD_BASE + GICD_TYPER);
+	con_hex2("GICD", "ctlr=", rd32(GICD_BASE + GICD_CTLR), "typer=", typer);
+	con_hex2("GICD", "iidr=", rd32(GICD_BASE + GICD_IIDR), "pidr2=", rd32(GICD_BASE + GICD_PIDR2));
+	con_hex2("GICC", "ctlr=", rd32(GICC_BASE + GICC_CTLR), "iidr=", rd32(GICC_BASE + GICC_IIDR));
 
-	stage = "gic dist";
-	uint32_t dctlr = rd32(GICD_BASE);
-	/* Non-secure view (DS=0): bit0 EnableGrp1, bit1 EnableGrp1A, bit4 ARE_NS; Linux writes 0x13 */
-	wr32(GICD_BASE, dctlr | 0x13);
-	gicd_wait_rwp();
-	con_hex2("GICD", "was=", dctlr, "now=", rd32(GICD_BASE));
-
-	stage = "gic redist";
-	uintptr_t r = find_gicr();
-	if (!r) {
-		con_str("GICR", "not found");
-		return;
+	stage = "gic setup";
+	/* Whatever S-BOOT left enabled stays quiet: only our two sources run. */
+	int nregs = (typer & 0x1f) + 1;
+	for (int i = 0; i < nregs; i++) {
+		wr32(GICD_BASE + GICD_ICENABLER + 4 * i, 0xffffffff);
+		wr32(GICD_BASE + GICD_ICPENDR + 4 * i, 0xffffffff);
 	}
-	uint32_t waker = rd32(r + GICR_WAKER);
-	if (waker & 2) {
-		wr32(r + GICR_WAKER, waker & ~2U);
-		for (int i = 0; i < 100000 && (rd32(r + GICR_WAKER) & 4); i++)
-			;
-	}
-	con_hex2("GICR", "base=", r, "waker=", rd32(r + GICR_WAKER));
-
-	stage = "gic config";
-	uint32_t grp = rd32(r + GICR_IGROUPR0);
-	wr32(r + GICR_IGROUPR0, 0xffffffff);	/* NS view: secure bits are WI */
-	uint32_t en_before = rd32(r + GICR_ISENABLER0);
-	uint32_t pri_before = rd32(r + GICR_IPRIORITYR + 16);	/* INTIDs 16..19 */
-	for (int id = 0; id < 32; id++)
-		wr8(r + GICR_IPRIORITYR + id, 0xa0);
-	wr32(r + GICR_ISENABLER0, (1U << VTIMER_INTID) | (1U << PTIMER_INTID) | (1U << SGI_INTID));
-	con_hex2("ENABLE", "was=", en_before, "now=", rd32(r + GICR_ISENABLER0));
-	con_hex2("IGROUP0", "was=", grp, "now=", rd32(r + GICR_IGROUPR0));
-	(void)pri_before;
-
-	uint64_t ctlr = rsr("icc_ctlr_el1");
-	wsr("icc_ctlr_el1", ctlr & ~2ULL);	/* EOImode 0: EOIR also deactivates */
-	wsr("icc_pmr_el1", 0xf0);
-	wsr("icc_bpr1_el1", 0);
-	wsr("icc_igrpen1_el1", 1);
-	isb();
-	con_hex2("ICC", "ctlr=", ctlr, "grpen1=", rsr("icc_igrpen1_el1"));
+	wr8(GICD_BASE + GICD_IPRIORITYR + VTIMER_INTID, 0xa0);
+	wr8(GICD_BASE + GICD_IPRIORITYR + SGI_INTID, 0xa0);
+	wr32(GICD_BASE + GICD_ISENABLER, (1U << VTIMER_INTID) | (1U << SGI_INTID));
+	wr32(GICD_BASE + GICD_CTLR, rd32(GICD_BASE + GICD_CTLR) | 1);	/* NS view: EnableGrp1 */
+	wr32(GICC_BASE + GICC_PMR, 0xf0);
+	wr32(GICC_BASE + GICC_BPR, 0);
+	/* EnableGrp1, EOImodeNS = 0: the EOIR write also deactivates */
+	wr32(GICC_BASE + GICC_CTLR, (rd32(GICC_BASE + GICC_CTLR) & ~(1U << 9)) | 1);
+	con_hex2("GIC ON", "dctlr=", rd32(GICD_BASE + GICD_CTLR), "cctlr=", rd32(GICC_BASE + GICC_CTLR));
 
 	stage = "gic vtimer";
-	irq_window("VTIMER", r, VTIMER_INTID);
+	irq_window("VTIMER", VTIMER_INTID);
 	stage = "gic sgi";
-	irq_window("SGI1", r, SGI_INTID);
-	wr32(r + GICR_ICENABLER0, 0xffffffff);
-	isb();
+	irq_window("SGI1", SGI_INTID);
+	wr32(GICD_BASE + GICD_ICENABLER, 0xffffffff);
 }
 
 /* ---- main ---- */
 
-static void __attribute__((unused)) psci_line(const char *label, uint64_t fn)
+void shim_main(uint64_t dtb, uint64_t el, uint64_t image)
 {
-	con_hex2(label, "feat=", smc(PSCI_FEATURES, fn, 0, 0), 0, 0);
-}
+	/* S-BOOT leaves the DECON on a software trigger: let it scan out memory (uniLoader) */
+	wr32(DECON_F_BASE + HW_SW_TRIG_CONTROL, 0x1281);
+	dsb();
 
-static uint64_t scratch[8192];	/* 64KB, lives in our (later cacheable) image */
-
-static uint64_t ticks_fill(uint32_t c)
-{
-	uint64_t t = now();
-	con_clear(c);
-	return now() - t;
-}
-
-static uint64_t ticks_mem(void)
-{
-	uint64_t t = now();
-	for (int pass = 0; pass < 16; pass++)
-		for (int i = 0; i < 8192; i++)
-			scratch[i] = scratch[i] * 3 + i;
-	return now() - t;
-}
-
-static uint32_t to_us(uint64_t ticks)
-{
-	return ticks * 10 / 192;	/* 19.2 MHz */
-}
-
-void shim_main(uint64_t dtb)
-{
-	struct mmu_info mi;
-
-	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
-	stage = "loader";
+	stage = "start";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
-	/* topaz: xnu needs the 16K granule (TGran16 != 0); Cortex-A53 may lack it */
-	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
-	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
-	con_hex2("MIDR", "el1=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
-	if (((mmfr0 >> 20) & 0xf) == 0) {
-		con_str("SILVER", "no 16K granule: handing off to gold CPU 0x100");
-		con_skip();
-		silver_ticks = speed_ticks();
-		gold_dtb = dtb;
-		__asm__ volatile("dsb sy" ::: "memory");
-		int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
-		if (r == 0) {
-			for (;;)	/* parked with DAIF masked (start.S) */
-				__asm__ volatile("wfi");
-		}
-		gold_dtb = 0;
-		con_hex("CPU_ON", (uint64_t)r);
+	con_str("SHIM", "a30s milestone 1: diagnostics");
+	con_hex2("ENTRY", "el=", el, "cntfrq=", rsr("cntfrq_el0"));
+	con_hex("IMAGE", image);
+	con_hex("X0 DTB", dtb);
+	/* only look at x0 if it points into the RAM S-BOOT reports */
+	if ((dtb & 3) == 0 && ((dtb >= 0x80000000UL && dtb < 0x100000000UL) ||
+			       (dtb >= 0x880000000UL && dtb < 0x8c0000000UL))) {
+		uint64_t rd_start = 0, rd_end = 0;
+		stage = "dtb";
+		con_hex2("DTB", "magic=", __builtin_bswap32(rd32(dtb)), "size=", __builtin_bswap32(rd32(dtb + 4)));
+		if (fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) &&
+		    fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
+			con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 	}
-	con_skip();
-	const char *why = loader_boot(dtb);
-	con_str("LOADER", why);
+	con_hex("SCTLR", rsr("sctlr_el1"));
 	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off. */
-	stage = "ufs";
-	test_ufs();
-	con_skip();
-	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
-	con_str("UFS", "probe done, reset in ~3 min");
-	delay_ms(180000);
-	reset(20);
-
-	stage = "fill off";
-	uint64_t fill_off = ticks_fill(RED);
-	uint64_t mem_off = ticks_mem();
-
-	stage = "mmu enable";
-	int rc = mmu_enable(&mi);
-
-	stage = "fill on";
-	uint64_t fill_on = rc ? 0 : ticks_fill(RED);
-	uint64_t mem_on = rc ? 0 : ticks_mem();
-	if (rc)
-		con_clear(RED);
-
-	con_str("SHIM", "sweet milestone 3");
-	con_skip();
-	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
-	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);
-	con_hex2("MMU", "rc=", rc, "l3=", mi.n_l3);
-	con_hex2("TTBR0", "pa=", mi.ttbr, "pa_hi=", mi.ttbr >> 32);
-	con_hex("SCTLR0", mi.sctlr_before);
-	con_hex("SCTLR1", mi.sctlr_after);
-	con_hex("TCR", rsr("tcr_el1"));
-	con_hex2("PARANGE", "mmfr0=", rsr("id_aa64mmfr0_el1") & 0xf, "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
-	con_skip();
-	con_hex("PAR img", mmu_probe((uintptr_t)shim_main));
-	con_hex("PAR fb", mmu_probe(FB_PHYS + 0x1000));
-	con_hex("PAR gic", mmu_probe(GICD_BASE));
-	con_hex("PAR 12G", mmu_probe(0x300000000UL));
-	con_skip();
-	con_hex2("FILL us", "off=", to_us(fill_off), "on=", to_us(fill_on));
-	con_hex2("MEM us", "off=", to_us(mem_off), "on=", to_us(mem_on));
+	/* the boot core is one of the eight: find which and report it like the others */
+	uint64_t self = rsr("mpidr_el1") & 0xffffff;
+	int self_idx = -1;
+	for (int i = 0; i < NR_CPUS; i++)
+		if (cpu_mpidr(i) == self)
+			self_idx = i;
+	con_hex2("BOOTCPU", "mpidr=", self, "midr=", rsr("midr_el1"));
+	if (self_idx >= 0)
+		report_self(self_idx, el);
+	test_smp(self_idx);
 	con_skip();
 
-	stage = "psci";
-	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
-	con_skip();
 	test_gic();
+	con_skip();
 
-	stage = "done";
-	reset(40);
+	stage = "keys";
+	con_hex("GPA1CON", rd32(GPA1_CON));
+	key_loop();
 }

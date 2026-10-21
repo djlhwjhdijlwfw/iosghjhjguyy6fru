@@ -1,14 +1,14 @@
 /*
- * Minimal text console on the ABL splash framebuffer. With the MMU off
+ * Minimal text console on the S-BOOT framebuffer. With the MMU off
  * every access is Device memory, so stay aligned (-mstrict-align).
  */
 #include "console.h"
 #include "font.h"
 
-#define SCALE		3
+#define SCALE		2	/* 720 px wide: 43 columns, 47 rows */
 #define CH_W		(8 * SCALE)
 #define CH_H		(16 * SCALE)
-#define MARGIN		24
+#define MARGIN		16
 #define LABEL_COLS	8
 
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
@@ -66,11 +66,16 @@ void con_skip(void)
 	row++;
 }
 
-void con_str(const char *label, const char *s)
+void con_strc(const char *label, const char *s, uint32_t fg)
 {
 	put_str(0, label, YELLOW);
-	put_str(LABEL_COLS, s, WHITE);
+	put_str(LABEL_COLS, s, fg);
 	row++;
+}
+
+void con_str(const char *label, const char *s)
+{
+	con_strc(label, s, WHITE);
 }
 
 void con_hex(const char *label, uint64_t v)
@@ -94,4 +99,14 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 		put_str(col, buf, WHITE);
 	}
 	row++;
+}
+
+int con_row(void)
+{
+	return row;
+}
+
+void con_set_row(int r)
+{
+	row = r;
 }

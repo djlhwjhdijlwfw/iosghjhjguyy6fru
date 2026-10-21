@@ -1,7 +1,44 @@
 /*
- * sweet boot shim entry: arm64 Linux Image header so Qualcomm ABL treats
- * us like a kernel. ABL enters at EL1, MMU/D-cache off, x0 = DTB pointer.
+ * a30s boot shim entry. S-BOOT jumps to the start of the kernel blob (it
+ * does not need the arm64 Linux Image header, which stays for tools), MMU
+ * and D-cache off, x0 = DTB pointer as for Linux. Which exception level it
+ * enters at is one of the things the diagnostics report: from EL2 we drop
+ * to EL1, where xnu runs.
  */
+/*
+ * x20 = the exception level we were entered at. From EL2, continue at EL1
+ * with the MMU off, AArch64, the counters and FP/SIMD untrapped and the
+ * real MIDR/MPIDR visible. Clobbers x1.
+ */
+.macro el1_entry
+	mrs	x20, CurrentEL
+	lsr	x20, x20, #2
+	cmp	x20, #2
+	b.ne	9f
+	mrs	x1, midr_el1
+	msr	vpidr_el2, x1
+	mrs	x1, mpidr_el1
+	msr	vmpidr_el2, x1
+	mov	x1, #(1 << 31)		/* HCR_EL2.RW */
+	msr	hcr_el2, x1
+	mov	x1, #3			/* EL1PCTEN | EL1PCEN */
+	msr	cnthctl_el2, x1
+	msr	cntvoff_el2, xzr
+	mov	x1, #0x33ff
+	msr	cptr_el2, x1
+	msr	hstr_el2, xzr
+	movz	x1, #0x0800
+	movk	x1, #0x30d0, lsl #16	/* SCTLR_EL1 RES1 bits, MMU and caches off */
+	msr	sctlr_el1, x1
+	mov	x1, #0x3c5		/* EL1h, DAIF masked */
+	msr	spsr_el2, x1
+	adr	x1, 9f
+	msr	elr_el2, x1
+	isb
+	eret
+9:
+.endm
+
 	.section .text.head, "ax"
 	.globl _head
 _head:
@@ -20,7 +57,8 @@ _head:
 	.globl _start
 _start:
 	msr	daifset, #0xf
-	mov	x19, x0			/* DTB pointer from ABL */
+	mov	x19, x0			/* DTB pointer from S-BOOT */
+	el1_entry
 	msr	spsel, #1
 	adr	x1, _stack_top
 	mov	sp, x1
@@ -35,22 +73,28 @@ _start:
 	str	xzr, [x1], #8
 	b	1b
 2:	mov	x0, x19
+	mov	x1, x20			/* exception level we were entered at */
+	adr	x2, _head		/* where S-BOOT put us */
 	bl	shim_main
 3:	wfe
 	b	3b
 
-/* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
+/* PSCI CPU_ON target. x0 = context id = cpu index (0..7). */
 	.globl secondary_entry
 secondary_entry:
 	msr	daifset, #0xf
+	mov	x19, x0
+	el1_entry
 	msr	spsel, #1
 	adr	x1, _sec_stacks
-	add	x1, x1, x0, lsl #12
+	add	x1, x1, x19, lsl #12
 	add	x1, x1, #0x1000
 	mov	sp, x1
 	adr	x1, vectors
 	msr	vbar_el1, x1
 	isb
+	mov	x0, x19
+	mov	x1, x20
 	bl	secondary_main
 4:	wfe
 	b	4b
