@@ -169,3 +169,7 @@ int strcmp(const char *, const char *);
 size_t strlen(const char *);
 char *strchr(const char *, int);
 void thread_deallocate(thread_t);
+typedef struct PE_Video {
+	unsigned long v_baseAddr, v_rowBytes, v_width, v_height, v_depth, v_display;
+} PE_Video;
+int PE_current_console(PE_Video *);

@@ -36,6 +36,8 @@ FB_W, FB_H, FB_STRIDE = 720, 1560, 720 * 4
 MMC, MMC_SIZE = 0x13500000, 0x2000
 # pinctrl alive bank GPA1 (CON, DAT at +4): keys, active low (bsd/dev/sweet_keys.c)
 GPIO_KEYS, GPIO_KEYS_SIZE = 0x11cb0060, 0x20
+# i2c_4 (s3c2440-type): the IST4050 touch controller at 0x50 (bsd/dev/sweet_ist.c)
+IST_I2C, IST_I2C_SIZE = 0x13870000, 0x100
 # arm,armv8-timer: CNTFRQ is 26 MHz (OSCCLK); the virtual timer is PPI 11
 TIMEBASE = 26000000
 VTIMER_INTID = 27
@@ -218,6 +220,13 @@ def build(seed=None, qemu=False):
         ('reg', u64(GPIO_KEYS, GPIO_KEYS_SIZE)),
     ])
 
+    # bsd/dev/sweet_ist.c: IST4050 at 0x50 on i2c_4 (pins, supply and clock in the driver)
+    ist_touch = node('sweet-ist-touch', [
+        ph(),
+        ('compatible', cstr('imagis,ist4050')),
+        ('reg', u64(IST_I2C, IST_I2C_SIZE)),
+    ])
+
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
@@ -254,7 +263,7 @@ def build(seed=None, qemu=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [mmc, gpio_keys]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [mmc, gpio_keys, ist_touch]))
 
 
 if __name__ == '__main__':

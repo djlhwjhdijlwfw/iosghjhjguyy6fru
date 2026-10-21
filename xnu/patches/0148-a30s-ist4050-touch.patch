@@ -1,0 +1,498 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 21cdb5c..f41a737 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
++bsd/dev/sweet_ist.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+diff --git a/bsd/dev/sweet_ist.c b/bsd/dev/sweet_ist.c
+new file mode 100755
+index 0000000..7151f09
+--- /dev/null
++++ b/bsd/dev/sweet_ist.c
+@@ -0,0 +1,451 @@
++/*
++ * a30s: the touch screen, an Imagis IST4050 (most A30s panels; ztOS's a30s
++ * dts and Samsung's A307FN ist40xx driver describe it) at 0x50 on the Exynos
++ * 7904's i2c_4, a plain s3c2440-type I2C controller (ADT /sweet-ist-touch,
++ * reg = that controller). Call once after the scheduler is running; all
++ * work runs on one kernel thread. Boot-arg sweettouch=0 disables it.
++ *
++ * Everything is polled: the controller's interrupt (GIC SPI 252) stays off
++ * and only its pending flag is watched; the IC's interrupt line (gpa0-0,
++ * active low) is read every 10 ms and the IC's message fetched when it is
++ * low, and every third tick anyway in case the IC only pulses it. Fingers
++ * go to sweet_hid_touch() in panel pixels (SweetHID.cpp maps them onto the
++ * presented display).
++ *
++ * Nothing here is left ready by the bootloader, so this turns on i2c_4's
++ * PCLK gate, puts gpp4-0/1 on the I2C function with pull-ups, switches the
++ * IC's 3.3 V on (gpg2-1, stock tsp_ldo_en) and puts the IC's I2C interface
++ * into 32-bit mode. IST4050 transfers are a big-endian 32-bit address and
++ * then big-endian 32-bit words. Its firmware runs from its own flash: no
++ * firmware or configuration is ever written.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_ist_touch_init(void);
++
++/* s3c2440 I2C */
++#define IICCON                  0x00
++#define IICSTAT                 0x04
++#define IICADD                  0x08
++#define IICDS                   0x0c
++#define IICLC                   0x10
++#define IICCON_ACKEN            (1u << 7)
++#define IICCON_TXDIV_512        (1u << 6)
++#define IICCON_IRQEN            (1u << 5)       /* needed for IRQPEND; the GIC line stays off */
++#define IICCON_IRQPEND          (1u << 4)
++#define IICCON_SCALE            3u              /* PCLK/512/4: 65 kHz at 133 MHz, < 200 kHz up to 400 MHz */
++#define IICSTAT_MASTER_RX       (2u << 6)
++#define IICSTAT_MASTER_TX       (3u << 6)
++#define IICSTAT_BUSY            (1u << 5)       /* write 1: START, 0: STOP */
++#define IICSTAT_TXRXEN          (1u << 4)
++#define IICSTAT_ARB             (1u << 3)
++#define IICSTAT_NACK            (1u << 0)       /* last received bit */
++#define IICLC_FILTER            (1u << 2)
++#define IICLC_SDA_DELAY5        (1u << 0)
++
++/* Exynos 7904 (exynos7885 in Linux): clock gate, pins, GIC */
++#define IST_CMU_PERI            0x10010000u
++#define IST_GATE_I2C4           0x2048u         /* CLK_CON_GAT_GOUT_PERI_I2C_4_PCLK */
++#define IST_GATE_ON             (1u << 21)
++#define IST_PIN_TOP             0x139b0000u     /* pinctrl_top */
++#define IST_GPP4                0x0a0u          /* gpp4-0/1: i2c_4 */
++#define IST_GPG2                0x160u          /* gpg2-1: the IC's 3.3 V */
++#define IST_PIN_ALIVE           0x11cb0000u
++#define IST_GPA0                0x040u          /* gpa0-0: the IC's interrupt */
++#define PIN_CON                 0x0u
++#define PIN_DAT                 0x4u
++#define PIN_PUD                 0x8u
++#define IST_GICD                0x12301000u
++#define IST_GICD_ICENABLER      0x180u
++#define IST_I2C4_INTID          (32u + 252u)
++
++/* IST4050 */
++#define IST_DEV                 0x50
++#define IST_DIRECT              (1u << 31)
++#define IST_BURST               (1u << 27)
++#define IST_HIB(n)              ((n) | (0x800bu << 16))
++#define IST_I2C_CTRL            (IST_DIRECT | 0x30000000u)
++#define IST_I2C_32BIT           0x003912d8u
++#define IST_INFO                IST_DIRECT      /* info block: 32 words, the last a checksum */
++#define IST_INFO_WORDS          32
++#define IST_SYS_CHIPID          (IST_DIRECT | 0x40001000u)
++#define IST_HIB_INTR_MSG        IST_HIB(0x30000104u)
++#define IST_HIB_COORD           IST_HIB(0x30000108u)
++#define IST_HIB_CMD             IST_HIB(0x3000015cu)
++#define IST_CMD_FW_START        0x01u
++#define IST_CMD_FW_HOLD         0x02u
++#define IST_CMD_MODE_SPECIAL    0x22u
++#define IST_MSG_INITIAL         0x8ead8eadu
++#define IST_MSG_EXCEPT_MASK     0xffffff00u
++#define IST_MSG_EXCEPT          0xe11ce900u
++#define IST_MSG_TOUCH           (1u << 11)
++#define IST_MSG_COUNT(m)        (((m) >> 12) & 0xfu)
++#define IST_F_Y(w)              ((w) & 0xfffu)
++#define IST_F_X(w)              (((w) >> 12) & 0xfffu)
++#define IST_F_STATUS(w)         (((w) >> 24) & 0xfu)
++#define IST_F_ID(w)             (((w) >> 28) & 0xfu)
++#define IST_STA_PRESS           1u
++#define IST_STA_RELEASE         2u
++#define IST_MAX_FINGERS         15
++#define IST_HID_FINGERS         10              /* SweetHID.cpp SWEET_TOUCH_FINGERS */
++
++static vm_offset_t ist_i2c, ist_top, ist_alive;
++static uint32_t ist_con;
++static uint32_t ist_w, ist_h;                   /* firmware's screen */
++static int ist_pw, ist_ph;                      /* panel */
++static bool ist_started;
++static int ist_chan;
++
++static inline uint32_t
++rd32(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++wr32(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++static void
++ist_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ist_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint64_t
++ist_deadline(uint64_t ns)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(ns, &t);
++	return mach_absolute_time() + t;
++}
++
++/* The byte (or address) in flight is done: IRQPEND, no lost arbitration. */
++static int
++ist_wait_pend(void)
++{
++	uint64_t deadline = ist_deadline(10 * NSEC_PER_MSEC);
++	while (!(rd32(ist_i2c + IICCON) & IICCON_IRQPEND)) {
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(2);
++	}
++	return (rd32(ist_i2c + IICSTAT) & IICSTAT_ARB) ? EIO : 0;
++}
++
++/*
++ * START, or a repeated START while the bus is held, with the address byte.
++ * As Linux's i2c-s3c2410: mode, address, IICCON written back unchanged (a
++ * pending flag cleared here would first send IICDS on the old phase), then
++ * START, which clears the flag.
++ */
++static int
++ist_start(uint8_t addr, uint32_t mode)
++{
++	uint32_t con = rd32(ist_i2c + IICCON);
++	wr32(ist_i2c + IICSTAT, mode | IICSTAT_TXRXEN);
++	wr32(ist_i2c + IICDS, addr);
++	delay(1);
++	wr32(ist_i2c + IICCON, con);
++	wr32(ist_i2c + IICSTAT, mode | IICSTAT_TXRXEN | IICSTAT_BUSY);
++	delay(2);
++	int error = ist_wait_pend();
++	if (!error && (rd32(ist_i2c + IICSTAT) & IICSTAT_NACK)) {
++		error = ENXIO;
++	}
++	return error;
++}
++
++static void
++ist_stop(uint32_t mode)
++{
++	wr32(ist_i2c + IICSTAT, mode | IICSTAT_TXRXEN);
++	wr32(ist_i2c + IICCON, ist_con);        /* flag cleared, ACK back on */
++	uint64_t deadline = ist_deadline(NSEC_PER_MSEC);
++	while ((rd32(ist_i2c + IICSTAT) & IICSTAT_BUSY) && mach_absolute_time() < deadline) {
++		delay(2);
++	}
++}
++
++/* wlen bytes to dev, then (rlen > 0) a repeated START and rlen bytes from it. */
++static int
++ist_xfer(uint8_t dev, const uint8_t *w, uint32_t wlen, uint8_t *r, uint32_t rlen)
++{
++	uint32_t mode = IICSTAT_MASTER_TX;
++	uint64_t deadline = ist_deadline(5 * NSEC_PER_MSEC);
++	int error;
++
++	while (rd32(ist_i2c + IICSTAT) & IICSTAT_BUSY) {
++		if (mach_absolute_time() > deadline) {
++			ist_stop(mode);
++			return EBUSY;
++		}
++		delay(10);
++	}
++	wr32(ist_i2c + IICCON, ist_con);
++	error = ist_start((uint8_t)(dev << 1), IICSTAT_MASTER_TX);
++	for (uint32_t i = 0; !error && i < wlen; i++) {
++		wr32(ist_i2c + IICDS, w[i]);
++		delay(1);
++		wr32(ist_i2c + IICCON, ist_con);        /* clear the flag: send it */
++		error = ist_wait_pend();
++		if (!error && (rd32(ist_i2c + IICSTAT) & IICSTAT_NACK)) {
++			error = EIO;
++		}
++	}
++	if (!error && rlen) {
++		mode = IICSTAT_MASTER_RX;
++		error = ist_start((uint8_t)(dev << 1 | 1), IICSTAT_MASTER_RX);
++		for (uint32_t i = 0; !error && i < rlen; i++) {
++			/* ACK every byte but the last */
++			wr32(ist_i2c + IICCON, i + 1 < rlen ? ist_con : ist_con & ~IICCON_ACKEN);
++			error = ist_wait_pend();
++			if (!error) {
++				r[i] = (uint8_t)rd32(ist_i2c + IICDS);
++			}
++		}
++	}
++	ist_stop(mode);
++	return error;
++}
++
++static int
++ist_read(uint32_t addr, uint32_t *words, uint32_t n)
++{
++	uint8_t a[4] = { (uint8_t)(addr >> 24), (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr };
++	uint8_t raw[4 * IST_INFO_WORDS];
++	if (n > IST_INFO_WORDS) {
++		return EINVAL;
++	}
++	int error = ist_xfer(IST_DEV, a, 4, raw, 4 * n);
++	for (uint32_t i = 0; !error && i < n; i++) {
++		words[i] = (uint32_t)raw[4 * i] << 24 | (uint32_t)raw[4 * i + 1] << 16 |
++		    (uint32_t)raw[4 * i + 2] << 8 | raw[4 * i + 3];
++	}
++	return error;
++}
++
++static int
++ist_write(uint32_t addr, uint32_t val)
++{
++	uint8_t b[8] = {
++		(uint8_t)(addr >> 24), (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr,
++		(uint8_t)(val >> 24), (uint8_t)(val >> 16), (uint8_t)(val >> 8), (uint8_t)val,
++	};
++	return ist_xfer(IST_DEV, b, sizeof(b), NULL, 0);
++}
++
++static int
++ist_cmd(uint32_t cmd, uint32_t arg)
++{
++	int error = ist_write(IST_HIB_CMD, cmd << 16 | (arg & 0xffffu));
++	ist_sleep_ms(2);
++	return error;
++}
++
++/* Clock, pins, the GIC line, the IC's supply and the bus. Returns 0 or an errno. */
++static int
++ist_hw_init(vm_offset_t cmu, vm_offset_t gicd)
++{
++	uint32_t gate = rd32(cmu + IST_GATE_I2C4);
++	if (!(gate & IST_GATE_ON)) {
++		wr32(cmu + IST_GATE_I2C4, gate | IST_GATE_ON);
++	}
++	/* The controller's interrupt is never wanted at the GIC. */
++	wr32(gicd + IST_GICD_ICENABLER + 4 * (IST_I2C4_INTID / 32), 1u << (IST_I2C4_INTID % 32));
++
++	uint32_t con = rd32(ist_top + IST_GPP4 + PIN_CON), pud = rd32(ist_top + IST_GPP4 + PIN_PUD);
++	wr32(ist_top + IST_GPP4 + PIN_CON, (con & ~0xffu) | 0x22u);     /* function 2: I2C */
++	wr32(ist_top + IST_GPP4 + PIN_PUD, (pud & ~0xffu) | 0x33u);     /* pull-up */
++
++	uint32_t ldo_con = rd32(ist_top + IST_GPG2 + PIN_CON), ldo_dat = rd32(ist_top + IST_GPG2 + PIN_DAT);
++	bool was_on = ((ldo_con >> 4) & 0xfu) == 1u && (ldo_dat & 2u);
++	printf("SWEET IST: i2c_4 gate %#x, gpp4 con %#x pud %#x, gpg2 con %#x dat %#x, gpa0 dat %#x\n",
++	    gate, con, pud, ldo_con, ldo_dat, rd32(ist_alive + IST_GPA0 + PIN_DAT));
++	wr32(ist_top + IST_GPG2 + PIN_DAT, ldo_dat | 2u);
++	wr32(ist_top + IST_GPG2 + PIN_CON, (ldo_con & ~0xf0u) | 0x10u);  /* output, high */
++
++	ist_con = IICCON_ACKEN | IICCON_TXDIV_512 | IICCON_IRQEN | IICCON_SCALE;
++	wr32(ist_i2c + IICCON, 0);
++	wr32(ist_i2c + IICSTAT, 0);
++	wr32(ist_i2c + IICLC, IICLC_FILTER | IICLC_SDA_DELAY5);
++	wr32(ist_i2c + IICADD, 0x10);
++	wr32(ist_i2c + IICCON, ist_con);
++	wr32(ist_i2c + IICSTAT, IICSTAT_TXRXEN);
++	ist_sleep_ms(was_on ? 10 : 60);         /* the IC boots its firmware */
++
++	int error = ENXIO;
++	for (int i = 0; i < 5 && error; i++) {
++		error = ist_write(IST_I2C_CTRL, IST_I2C_32BIT);
++		if (error) {
++			ist_sleep_ms(20);
++		}
++	}
++	if (error) {
++		/* Some A30s panels carry a Zinitix ZT7548 at 0x20 instead. */
++		uint8_t b = 0;
++		int z = ist_xfer(0x20, &b, 1, NULL, 0);
++		printf("SWEET IST: no IST4050 at 0x50 (%d)%s\n", error,
++		    z == 0 ? "; something answers at 0x20 (a Zinitix ZT7548?), not supported" : "");
++	}
++	return error;
++}
++
++/* The firmware's info block, read with the scan held. */
++static int
++ist_info(void)
++{
++	uint32_t info[IST_INFO_WORDS], chip = 0, sum = 0;
++	int error = ist_cmd(IST_CMD_FW_HOLD, 1);
++	if (!error) {
++		ist_sleep_ms(20);
++		error = ist_read(IST_INFO | IST_BURST, info, IST_INFO_WORDS);
++	}
++	if (!error) {
++		error = ist_read(IST_SYS_CHIPID, &chip, 1);
++	}
++	(void)ist_cmd(IST_CMD_FW_HOLD, 0);
++	if (error) {
++		printf("SWEET IST: info block not readable (%d)\n", error);
++		return error;
++	}
++	for (int i = 0; i < IST_INFO_WORDS - 1; i++) {
++		sum += info[i];
++	}
++	uint32_t lcd = info[0x10], swap = info[0x17];
++	ist_w = (swap & 1) ? (lcd & 0xffffu) : (lcd >> 16);
++	ist_h = (swap & 1) ? (lcd >> 16) : (lcd & 0xffffu);
++	printf("SWEET IST: chip %#x/%#x, main %#x, firmware %#x, channels %ux%u, screen %ux%u, swap %#x, checksum %s\n",
++	    info[0], chip, info[1], info[2], info[0x11] & 0xffffu, info[0x11] >> 16, ist_w, ist_h, swap,
++	    sum == info[IST_INFO_WORDS - 1] ? "ok" : "BAD");
++	if (sum != info[IST_INFO_WORDS - 1] || info[0] != chip || ist_w == 0 || ist_h == 0) {
++		ist_w = (uint32_t)ist_pw;
++		ist_h = (uint32_t)ist_ph;
++	}
++	return 0;
++}
++
++static void
++ist_thread(void *arg, wait_result_t result)
++{
++	vm_offset_t *maps = arg;
++	uint32_t f[2 * IST_MAX_FINGERS];
++	uint32_t down = 0, logged = 0, errors = 0, tick = 0;
++	(void)result;
++
++	if (ist_hw_init(maps[0], maps[1]) != 0 || ist_info() != 0) {
++		return;
++	}
++	(void)ist_cmd(IST_CMD_MODE_SPECIAL, 0);         /* normal mode: no charger, cover or glove */
++	(void)ist_cmd(IST_CMD_FW_START, 1);
++	printf("SWEET IST: touch running (panel %dx%d)\n", ist_pw, ist_ph);
++
++	for (;;) {
++		ist_sleep_ms(10);
++		bool irq = !(rd32(ist_alive + IST_GPA0 + PIN_DAT) & 1u);
++		if (!irq && (++tick % 3) != 0) {
++			continue;
++		}
++		uint32_t msg = 0;
++		if (ist_read(IST_HIB_INTR_MSG, &msg, 1) != 0) {
++			if ((errors++ % 500) == 0) {
++				printf("SWEET IST: message read failed (%u)\n", errors);
++			}
++			continue;
++		}
++		/* (an exception message has the touch bit set too: test it first) */
++		if ((msg & IST_MSG_EXCEPT_MASK) == IST_MSG_EXCEPT) {
++			if ((errors++ % 500) == 0) {
++				printf("SWEET IST: controller exception %#x\n", msg & 0xffu);
++			}
++			continue;
++		}
++		if (msg == IST_MSG_INITIAL || !(msg & IST_MSG_TOUCH)) {
++			continue;               /* firmware start, calibration, self tests, gestures */
++		}
++		uint32_t n = MIN(IST_MSG_COUNT(msg), (uint32_t)IST_MAX_FINGERS);
++		if (n == 0 || ist_read(IST_HIB_COORD | IST_BURST, f, 2 * n) != 0) {
++			continue;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			int id = (int)IST_F_ID(f[2 * i]) - 1;
++			uint32_t st = IST_F_STATUS(f[2 * i]);
++			if (id < 0 || id >= IST_HID_FINGERS || (st != IST_STA_PRESS && st != IST_STA_RELEASE)) {
++				continue;       /* none, or a move under the threshold */
++			}
++			int x = (int)(IST_F_X(f[2 * i]) * (uint32_t)ist_pw / ist_w);
++			int y = (int)(IST_F_Y(f[2 * i]) * (uint32_t)ist_ph / ist_h);
++			bool press = st == IST_STA_PRESS;
++			if (press != ((down >> id) & 1u) && logged < 40) {
++				logged++;
++				printf("SWEET IST: finger %d %s at %d,%d\n", id, press ? "down" : "up", x, y);
++			}
++			down = press ? down | (1u << id) : down & ~(1u << id);
++			sweet_hid_touch(id, press, x, y);
++		}
++	}
++}
++
++void
++sweet_ist_touch_init(void)
++{
++	static vm_offset_t maps[2];
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	int enabled = 1;
++	PE_Video video;
++	thread_t thread;
++
++	if (ist_started) {
++		return;
++	}
++	ist_started = true;
++	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET IST: disabled (sweettouch=0)\n");
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/sweet-ist-touch", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET IST: no /sweet-ist-touch node in the device tree\n");
++		return;
++	}
++	PE_current_console(&video);
++	ist_pw = video.v_width ? (int)video.v_width : 720;
++	ist_ph = video.v_height ? (int)video.v_height : 1560;
++	ist_i2c = ml_io_map(reg[0], reg[1]);
++	ist_top = ml_io_map(IST_PIN_TOP, PAGE_SIZE);
++	ist_alive = ml_io_map(IST_PIN_ALIVE, PAGE_SIZE);
++	maps[0] = ml_io_map(IST_CMU_PERI, IST_GATE_I2C4 + PAGE_SIZE);
++	maps[1] = ml_io_map(IST_GICD, PAGE_SIZE);
++	if (!ist_i2c || !ist_top || !ist_alive || !maps[0] || !maps[1]) {
++		printf("SWEET IST: MMIO mapping failed\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(ist_thread, maps, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET IST: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index f72e071..7ca1f28 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_gpio_keys_init(void);
++extern void sweet_ist_touch_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+@@ -1397,11 +1398,13 @@ sweet_ufs_init(void)
+ 	}
+ 	if (su.mmc) {
+ 		/*
+-		 * a30s: the keys are GPIOs (ADT /sweet-gpio-keys); SweetHID's touch
+-		 * driver and USB drive Qualcomm blocks.
++		 * a30s: the keys are GPIOs (ADT /sweet-gpio-keys), the touch screen an
++		 * IST4050 on i2c_4 (sweet_ist.c, ADT /sweet-ist-touch); USB drives
++		 * Qualcomm blocks.
+ 		 */
+ 		sweet_gpio_keys_init();
+-		printf("SWEET MMC: touch and USB skipped\n");
++		sweet_ist_touch_init();
++		printf("SWEET MMC: USB skipped\n");
+ 		return 0;
+ 	}
+ 	/*
