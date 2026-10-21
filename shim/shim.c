@@ -11,10 +11,16 @@
  * Results stay on screen. Volume Up held for a second restarts into TWRP,
  * Volume Down into download mode; any exception paints a blue panic screen
  * and waits for the same keys.
+ *
+ * a30s milestone 2: with an xnu payload appended (build.sh PAYLOAD), the boot
+ * core (an A53, no 16K granule) turns the GIC on, wakes A73 0x0 with PSCI
+ * CPU_ON and lets it load and enter xnu; the A53 then only watches the keys,
+ * so Volume Up still restarts into TWRP whatever xnu does.
  */
 #include <stdint.h>
 #include "console.h"
 #include "fdt.h"
+#include "loader.h"
 
 /* Exynos 7885 / 7904 */
 #define DECON_F_BASE		0x14860000UL
@@ -119,6 +125,11 @@ struct cpu_report {
 #define MBOX_BASE	0xec800000UL
 #define rep		((volatile struct cpu_report *)MBOX_BASE)
 static uint64_t boot_mpidr;
+/* The core whose exceptions paint the panic screen: the boot core, then the A73 running xnu. */
+static volatile uint64_t screen_mpidr;
+/* Set (with the DTB) before the boot core wakes the A73 that boots xnu. */
+static volatile uint64_t xnu_dtb;
+#define XNU_CPU			6	/* A73 0x0, see cpu_mpidr() */
 
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
@@ -281,7 +292,7 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 		wsr("elr_el1", rsr("elr_el1") + 4);
 		return;
 	}
-	if (mpidr != boot_mpidr) {	/* leave the screen to the boot core */
+	if (mpidr != screen_mpidr) {	/* leave the screen to its owner */
 		me->esr = rsr("esr_el1");
 		me->elr = rsr("elr_el1");
 		me->far = rsr("far_el1");
@@ -369,6 +380,17 @@ static void life_bar(int idx, int x0, int x1, uint32_t color)
 	civac((void *)row, 16 * FB_STRIDE);
 }
 
+/* On A73 0x0: load the payload and enter xnu (MMU and caches still off). */
+static void __attribute__((noreturn)) xnu_main(uint64_t dtb, uint64_t el)
+{
+	stage = "xnu loader";
+	con_strc("A73", "up: loading xnu", GREEN);
+	con_hex2("A73", "midr=", rsr("midr_el1"), "el=", el);
+	con_hex("MMFR0", rsr("id_aa64mmfr0_el1"));
+	con_str("LOADER", loader_boot(dtb));	/* returns only on error */
+	key_loop();
+}
+
 /* idx comes from MPIDR (start.S); ctx is x0 as PSCI CPU_ON delivered it */
 void secondary_main(uint64_t idx, uint64_t el, uint64_t ctx)
 {
@@ -378,6 +400,8 @@ void secondary_main(uint64_t idx, uint64_t el, uint64_t ctx)
 	dsb();
 	c->arrived = 1;
 	civac(c, sizeof(*c));
+	if (xnu_dtb && idx == XNU_CPU)
+		xnu_main(xnu_dtb, el);
 	report_self(idx & (NR_CPUS - 1), el);
 	civac(c, sizeof(*c));
 	life_bar(idx & (NR_CPUS - 1), 360, FB_W, GREEN);
@@ -666,18 +690,89 @@ static void test_gic(void)
 	wr32(GICD_BASE + GICD_ICENABLER, 0xffffffff);
 }
 
+/* ---- milestone 2: xnu on A73 0x0 ---- */
+
+/*
+ * After the hand-off: draw nothing (the screen is xnu's), only watch the
+ * keys. Volume Up held for a second restarts into TWRP, Volume Down into
+ * download mode, whether xnu runs, hangs or panics.
+ */
+static void __attribute__((noreturn)) watch_keys(void)
+{
+	uint64_t f = rsr("cntfrq_el0"), held_since = 0;
+	uint32_t held = 0;
+
+	for (;;) {
+		uint32_t k = ~rd32(GPA1_DAT) & (KEY_VOLUP | KEY_VOLDOWN);
+		if (k != held) {
+			held = k;
+			held_since = now();
+		} else if (k && now() - held_since > f) {
+			restart_into(k & KEY_VOLUP ? INFORM3_RECOVERY : INFORM3_DOWNLOAD);
+		}
+		delay_ms(50);
+	}
+}
+
+static void __attribute__((noreturn)) boot_xnu(uint64_t dtb, uint64_t el, uint64_t image, uintptr_t payload)
+{
+	uint64_t f = rsr("cntfrq_el0");
+
+	stage = "xnu hand-off";
+	con_str("SHIM", "a30s milestone 2: xnu on A73 0x0");
+	con_hex2("ENTRY", "el=", el, "cntfrq=", f);
+	con_hex("IMAGE", image);
+	con_hex("PAYLOAD", payload);
+	con_hex("X0 DTB", dtb);
+
+	/*
+	 * The A73 reads the payload with its caches off: get anything S-BOOT
+	 * left in the caches to memory. image_size (header +16) covers the
+	 * appended payload.
+	 */
+	civac((void *)image, *(volatile uint64_t *)(image + 16));
+
+	volatile uint64_t *mbox = (volatile uint64_t *)MBOX_BASE;
+	for (unsigned i = 0; i < NR_CPUS * sizeof(struct cpu_report) / 8; i++)
+		mbox[i] = 0;
+	civac((void *)MBOX_BASE, NR_CPUS * sizeof(struct cpu_report));
+
+	/* PSCI CPU_ON leaves a core parked for good unless the GIC is on (milestone 1d) */
+	gic_on();
+	xnu_dtb = dtb;
+	screen_mpidr = cpu_mpidr(XNU_CPU);
+	civac(&xnu_dtb, sizeof(xnu_dtb));
+	civac(&screen_mpidr, sizeof(screen_mpidr));
+
+	int64_t r = (int64_t)smc(PSCI_CPU_ON, cpu_mpidr(XNU_CPU), (uintptr_t)secondary_entry, XNU_CPU);
+	con_hex2("CPU_ON", "mpidr=", cpu_mpidr(XNU_CPU), "ret=", (uint32_t)r);
+	for (int t = 0; t < 200 && r == 0; t++) {
+		civac(&rep[XNU_CPU], sizeof(rep[XNU_CPU]));
+		if (rep[XNU_CPU].arrived)
+			watch_keys();
+		delay_ms(10);
+	}
+	screen_mpidr = boot_mpidr;
+	con_strc("A73", "did not start: no xnu", YELLOW);
+	key_loop();
+}
+
 /* ---- main ---- */
 
 void shim_main(uint64_t dtb, uint64_t el, uint64_t image)
 {
 	/* first: the exception handler tells the boot core from secondaries by it */
 	boot_mpidr = rsr("mpidr_el1") & 0xffffff;
+	screen_mpidr = boot_mpidr;
 	/* S-BOOT leaves the DECON on a software trigger: let it scan out memory (uniLoader) */
 	wr32(DECON_F_BASE + HW_SW_TRIG_CONTROL, 0x1281);
 	dsb();
 
 	stage = "start";
 	con_clear(RED);
+	uintptr_t payload = loader_payload();
+	if (payload)
+		boot_xnu(dtb, el, image, payload);
 	con_str("SHIM", "a30s milestone 1d: diagnostics");
 	con_hex2("ENTRY", "el=", el, "cntfrq=", rsr("cntfrq_el0"));
 	con_hex("IMAGE", image);

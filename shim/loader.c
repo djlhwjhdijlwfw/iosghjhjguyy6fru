@@ -79,6 +79,13 @@ typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 /* build.sh appends the payload to the Image at the first 4K boundary after _end */
 extern char _end[];
 
+uintptr_t loader_payload(void)
+{
+	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
+
+	return magic_ok((const char *)emb) ? emb : 0;
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;

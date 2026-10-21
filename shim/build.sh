@@ -4,8 +4,11 @@
 # base 0x10000000, 2 KiB pages, no DTB in the image (S-BOOT passes the one
 # from the DTB partition), Samsung's SEANDROIDENFORCE trailer.
 #
-# Milestone 1 is diagnostics only: no xnu payload yet (loader.c, mmu.c and
-# ufs.c are topaz's and not built).
+#   shim/build.sh            milestone 1: diagnostics only
+#   shim/build.sh PAYLOAD    milestone 2: boot the xnu payload (tools/mkpayload.py)
+#                            on A73 0x0; it rides behind the shim in the image
+#
+# mmu.c and ufs.c are topaz's and not built.
 #
 #   CROSS  aarch64 toolchain prefix (default aarch64-linux-gnu-)
 #   ZTOS   the ztOS checkout with devices/a30s (default /mnt/d/ios30/ztOS)
@@ -18,13 +21,13 @@ CC=${CROSS}gcc
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-tree-loop-distribute-patterns -Wall -Wextra"
 OBJS=
 mkdir -p out
-for f in start.S shim.c console.c fdt.c; do
+for f in start.S shim.c console.c fdt.c loader.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 	OBJS="$OBJS out/${f%.*}.o"
 done
 # S-BOOT runs the image wherever it loads it with no relocation pass: only
 # the header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$(${CROSS}readelf -r out/shim.o out/console.o out/fdt.o | grep -c ABS64 || true)
+abs=$(${CROSS}readelf -r out/shim.o out/console.o out/fdt.o out/loader.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
 	$OBJS -o out/shim.elf
@@ -32,6 +35,14 @@ ${CROSS}objcopy -O binary out/shim.elf out/Image
 # S-BOOT copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
 size=$((16#$(${CROSS}nm out/shim.elf | awk '$3=="_end"{print $1}')))
 truncate -s "$size" out/Image
+if [ -n "${1:-}" ]; then
+	# The payload goes behind the shim at the first 4K boundary after _end
+	# (loader.c); image_size in the header grows to cover it.
+	truncate -s $(( (size + 0xfff) & ~0xfff )) out/Image
+	cat "$1" >> out/Image
+	python3 -c 'import os,struct,sys; f=open(sys.argv[1],"r+b"); f.seek(16); f.write(struct.pack("<Q", os.path.getsize(sys.argv[1])))' out/Image
+	echo "payload $1 appended: Image $(stat -c %s out/Image) bytes"
+fi
 # An empty ramdisk, as ztOS's boot image has.
 printf '' | gzip -n > out/ramdisk.gz
 python3 -I "$MKBOOTIMG" --kernel out/Image --ramdisk out/ramdisk.gz \

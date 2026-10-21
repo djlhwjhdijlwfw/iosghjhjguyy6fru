@@ -22,7 +22,9 @@ An undecodable or blank screen returns 3 with --fail-on-panic.
 """
 import argparse, json, os, socket, struct, subprocess, sys, time, zlib
 
-FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
+# The panel boot_args describe and fb.png shows; --fb changes it (a30s:
+# 0xec000000:720x1560, matching mkadt.py's sweet-fbcon node)
+FB_BASE, FB_W, FB_H = 0xec000000, 720, 1560
 FB_STRIDE = FB_W * 4
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
@@ -152,10 +154,17 @@ def main():
     ap.add_argument('--secs', type=float, default=20)
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
-    ap.add_argument('--cpu', default='cortex-a76')	# ARMv8.2 like Kryo 470, same ID_AA64MMFR0
+    ap.add_argument('--cpu', default='max')	# 16K granule; QEMU 6.2 has no cortex-a76
+    ap.add_argument('--gic', default='2', choices=('2', '3'), help='virt GIC version (a30s: 2, topaz/sweet: 3)')
+    ap.add_argument('--fb', default='0xec000000:720x1560', help='framebuffer BASE:WxH (topaz: 0x5c000000:1080x2400)')
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     a = ap.parse_args()
+    global FB_BASE, FB_W, FB_H, FB_STRIDE
+    base, size = a.fb.split(':')
+    FB_BASE = int(base, 0)
+    FB_W, FB_H = (int(v) for v in size.split('x'))
+    FB_STRIDE = FB_W * 4
     if a.fail_on_panic and not a.kernel:
         ap.error('--fail-on-panic requires --kernel')
     payload = open(a.payload, 'rb').read()
@@ -181,7 +190,8 @@ def main():
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
-    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
+    cmd = [os.environ.get('QEMU', 'qemu-system-aarch64'), '-M', f'virt,gic-version={a.gic}', '-cpu', a.cpu,
+           '-smp', '1', '-m', f'{ram_gib}G', '-nic', 'none',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',

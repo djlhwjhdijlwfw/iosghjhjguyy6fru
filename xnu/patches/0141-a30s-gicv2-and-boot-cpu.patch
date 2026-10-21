@@ -1,0 +1,323 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 96c557b..44cb0f7 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,7 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++extern "C" void sweet_gic_send_sgi(unsigned int cpu, uint64_t mpidr);
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -145,12 +146,12 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		IOSleep(1);
+ 	}
+ 	/*
+-	 * topaz: the ADT lists only the A73 (gold) cores and the shim boots xnu
+-	 * on gold CPU 0x100 (the silver cluster has no 16K granule).
++	 * The ADT lists only the cores with the 16K granule and the shim boots
++	 * xnu on the first of them: topaz gold CPU 0x100, a30s A73 0x0.
+ 	 */
+-	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0x100) {
+-		panic("SWEET CPU: expected boot MPIDR 0x100 and logical CPU 0, got 0x%x/%u",
+-		    topology->boot_cpu->phys_id, topology->boot_cpu->cpu_id);
++	if (topology->boot_cpu->cpu_id != 0) {
++		panic("SWEET CPU: expected boot on the first ADT core (MPIDR 0x%x), got 0x%x/%u",
++		    topology->cpus[0].phys_id, topology->boot_cpu->phys_id, topology->boot_cpu->cpu_id);
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+@@ -218,19 +219,7 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	if (logical >= topology->num_cpus) {
+ 		panic("SWEET CPU: invalid SGI target %u", logical);
+ 	}
+-	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+-	uint64_t mpidr = topology->cpus[logical].phys_id;
+-	unsigned int aff0 = mpidr & 0xff;
+-	if (aff0 >= 16) {
+-		panic("SWEET CPU: SGI target requires unsupported range selector");
+-	}
+-	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
+-	    (((mpidr >> 16) & 0xff) << 32) |
+-	    (((mpidr >> 8) & 0xff) << 16) |
+-	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
+-	__builtin_arm_dsb(DSB_ISHST);
+-	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+-	__builtin_arm_isb(ISB_SY);
++	sweet_gic_send_sgi(logical, topology->cpus[logical].phys_id);
+ }
+ 
+ kern_return_t
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index a2a8c1b..a835726 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1939,8 +1939,8 @@ sleh_irq(arm_saved_state_t *state)
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
+-	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+-	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++	uint32_t intid;
++	uint32_t iar = sweet_gic_ack(&intid);
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+@@ -1951,11 +1951,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		sweet_gic_eoi(iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		sweet_gic_eoi(iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+@@ -1966,7 +1966,7 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		sweet_gic_eoi(iar);
+ 	}
+ 	__builtin_arm_isb(ISB_SY);
+ #else
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..fac2c9b 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -306,11 +306,16 @@ LEXT(sweet_secondary_entry)
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
+-	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
++	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access, */
++	/* if there is one: ID_AA64PFR0_EL1.GIC is 0 with a GIC-400 (a30s). */
++	mrs		x1, ID_AA64PFR0_EL1
++	ubfx	x1, x1, #24, #4
++	cbz		x1, Lsweet_secondary_no_icc
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++Lsweet_secondary_no_icc:
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..ac6e323 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -50,6 +50,60 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ #define gicr_write32(offset, data) (_gic_write32(gicr_pe_base + (offset), (data)))
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
+ 
++#if defined(SWEET)
++/*
++ * a30s: the Exynos 7904 has a GIC-400 (GICv2): no redistributors and no
++ * system-register CPU interface, a memory-mapped one (GICC) instead.
++ */
++SECURITY_READ_ONLY_LATE(bool) sweet_gic_v2 = false;
++static vm_offset_t gicc_base;
++/* Each CPU's interface bit, for SGI target lists (from GICD_ITARGETSR0). */
++static uint8_t sweet_gicv2_cpumask[MAX_CPUS];
++
++#define gicc_read32(offset) (_gic_read32(gicc_base + (offset)))
++#define gicc_write32(offset, data) (_gic_write32(gicc_base + (offset), (data)))
++
++/* First string of a DT compatible property equals want. */
++static bool
++sweet_compatible_is(void const *prop, unsigned int size, const char *want)
++{
++	const char *s = prop;
++	unsigned int i = 0;
++
++	for (; want[i] != '\0'; i++) {
++		if (i >= size || s[i] != want[i]) {
++			return false;
++		}
++	}
++	return i < size && s[i] == '\0';
++}
++
++/* Per CPU: SGI/PPI enables and priorities are banked per CPU interface. */
++static void
++sweet_gicv2_init_cpu(void)
++{
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicd_write32(GICD_IPRIORITYR + i, 0xA0A0A0A0);
++	}
++	gicd_write32(GICD_ISENABLER, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++
++	/* GICD_ITARGETSR0..7 are read-only: each byte is this CPU's own bit. */
++	uint32_t mask = gicd_read32(GICD_ITARGETSR) & 0xff;
++	unsigned int cpu = ml_get_cpu_number_local();
++	if (mask == 0 || cpu >= MAX_CPUS) {
++		panic("%s: core %u has no GIC CPU interface (mask 0x%x)", __func__, cpu, mask);
++	}
++	sweet_gicv2_cpumask[cpu] = (uint8_t)mask;
++
++	gicc_write32(GICC_PMR, 0xFF);
++	gicc_write32(GICC_BPR, 0);
++	/* EnableGrp1, EOImodeNS = 0: the EOIR write also deactivates */
++	gicc_write32(GICC_CTLR, (gicc_read32(GICC_CTLR) & ~GICC_CTLR_EOIMODENS) | GICC_CTLR_ENABLEGRP1);
++	gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ENABLEGRP1);
++	kprintf("SWEET GIC: cpu %u GICv2 interface mask 0x%x\n", cpu, mask);
++}
++#endif /* SWEET */
++
+ static vm_offset_t
+ find_gicr_pe_base()
+ {
+@@ -117,6 +171,14 @@ pe_init_fiq()
+ 			sweet_vtimer_intid = intid;
+ 		}
+ 		kprintf("SWEET GIC: virtual timer INTID %u\n", sweet_vtimer_intid);
++
++		void const *compat;
++		unsigned int compat_size;
++		if (SecureDTGetProperty(entry, "compatible", &compat, &compat_size) == kSuccess &&
++		    sweet_compatible_is(compat, compat_size, "arm,gic-400")) {
++			sweet_gic_v2 = true;
++		}
++		kprintf("SWEET GIC: %s\n", sweet_gic_v2 ? "GICv2 (GIC-400): reg = GICD, GICC" : "GICv3");
+ #endif
+ 
+ 		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
+@@ -141,7 +203,22 @@ pe_init_fiq()
+ 		}
+ 
+ 		gicr_size = gicr_size_prop;
++#if defined(SWEET)
++		/* GICv2: the second region is the CPU interface, not redistributors */
++		if (sweet_gic_v2) {
++			gicc_base = gicr_base;
++			gicr_base = 0;
++			gicr_size = 0;
++		}
++#endif
++	}
++
++#if defined(SWEET)
++	if (sweet_gic_v2) {
++		sweet_gicv2_init_cpu();
++		return;
+ 	}
++#endif
+ 
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+@@ -222,6 +299,61 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++
++#if defined(SWEET)
++/* Acknowledge the highest-priority pending Group 1 interrupt. */
++uint32_t
++sweet_gic_ack(uint32_t *intid)
++{
++	uint32_t iar;
++
++	if (sweet_gic_v2) {
++		/* Bits 12:10 name the CPU that sent an SGI: EOIR wants them back. */
++		iar = gicc_read32(GICC_IAR);
++		*intid = iar & GICC_IAR_INTID_MASK;
++	} else {
++		iar = (uint32_t)__builtin_arm_rsr64("ICC_IAR1_EL1");
++		*intid = iar & 0xFFFFFF;
++	}
++	return iar;
++}
++
++void
++sweet_gic_eoi(uint32_t iar)
++{
++	if (sweet_gic_v2) {
++		gicc_write32(GICC_EOIR, iar);
++	} else {
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++	}
++}
++
++/* Cross-CPU signal (SGI SWEET_IPI_SGI) to logical CPU cpu, MPIDR mpidr. */
++void
++sweet_gic_send_sgi(unsigned int cpu, uint64_t mpidr)
++{
++	__builtin_arm_dsb(DSB_ISHST);
++	if (sweet_gic_v2) {
++		uint8_t mask = cpu < MAX_CPUS ? sweet_gicv2_cpumask[cpu] : 0;
++		if (mask == 0) {
++			panic("SWEET GIC: SGI to cpu %u before its GIC interface is known", cpu);
++		}
++		gicd_write32(GICD_SGIR, ((uint32_t)mask << 16) | GICD_SGIR_NSATT | SWEET_IPI_SGI);
++		return;
++	}
++	/* GICv3: the TARGET affinity, including Aff1, never the sender's MPIDR. */
++	unsigned int aff0 = mpidr & 0xff;
++	if (aff0 >= 16) {
++		panic("SWEET GIC: SGI target requires unsupported range selector");
++	}
++	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
++	    (((mpidr >> 16) & 0xff) << 32) |
++	    (((mpidr >> 8) & 0xff) << 16) |
++	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
++	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
++	__builtin_arm_isb(ISB_SY);
++}
++#endif /* SWEET */
+ #else
+ void
+ pe_init_fiq()
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..6f04e48 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,10 @@ int uart_getc(void);
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
++/* GICv3 or GICv2, whichever the ADT names (pe_fiq.c) */
++uint32_t sweet_gic_ack(uint32_t *intid);
++void sweet_gic_eoi(uint32_t iar);
++void sweet_gic_send_sgi(unsigned int cpu, uint64_t mpidr);
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 424e1c0..423617b 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -81,4 +81,27 @@
+ #define ICC_SRE_SRE                             0x1
+ /* End of GICv3 register definitions */
+ 
++/*
++ * GICv2 (GIC-400) register definitions; see the GICv2 spec (Arm IHI 0048B).
++ * a30s (Exynos 7904): the ADT's /arm-io/gic says "arm,gic-400", and its reg
++ * is then GICD base/size, GICC base/size. Non-secure view: EnableGrp1 is
++ * bit 0 of GICD_CTLR and GICC_CTLR.
++ */
++#define GICD_ISENABLER                          0x100
++#define GICD_IPRIORITYR                         0x400
++#define GICD_ITARGETSR                          0x800
++#define GICD_SGIR                               0xF00
++#define GICD_SGIR_NSATT                         0x8000
++
++#define GICC_CTLR                               0x00
++#define GICC_PMR                                0x04
++#define GICC_BPR                                0x08
++#define GICC_IAR                                0x0C
++#define GICC_EOIR                               0x10
++
++#define GICC_CTLR_ENABLEGRP1                    0x1
++#define GICC_CTLR_EOIMODENS                     0x200
++#define GICC_IAR_INTID_MASK                     0x3FF
++/* End of GICv2 register definitions */
++
+ #endif /* ! _PEXPERT_ARM64_SWEET_H */
