@@ -171,6 +171,20 @@ secondary_entry:
 	b	4b
 
 /*
+ * xnu's secondary-core trampoline. Samsung's PSCI 0.1 CPU_ON returns 0 but
+ * never starts a core whose entry point is above 4 GiB, and xnu runs at
+ * 0x8_80000000. loader.c passes this address as sweettramp=; xnu writes its
+ * real entry point into the slot at +8 and gives CPU_ON this address. Runs
+ * with the MMU off at whatever EL the core arrives in; x0 is left alone.
+ */
+	.balign	64
+	.globl	sweet_tramp
+sweet_tramp:
+	ldr	x1, 1f
+	br	x1
+1:	.quad	0
+
+/*
  * Exception vectors. Each slot stashes x29/x30, loads its slot number
  * and jumps to the common path, which saves x0-x28 and calls
  * exc_handler(slot, regs). IRQs return; everything else ends in the

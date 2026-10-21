@@ -76,6 +76,28 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+extern char sweet_tramp[];
+
+/* " sweettramp=0x<sweet_tramp's address>" behind the boot-args (start.S). */
+static void append_tramp(volatile char *line)
+{
+	static const char key[] = " sweettramp=0x";
+	static const char hex[] = "0123456789abcdef";
+	uint64_t pa = (uintptr_t)sweet_tramp;
+	int n = 0;
+
+	while (n < BOOT_LINE_LENGTH && line[n])
+		n++;
+	if (n + (int)sizeof(key) + 16 >= BOOT_LINE_LENGTH)
+		return;
+	for (int i = 0; key[i]; i++)
+		line[n++] = key[i];
+	for (int s = 60; s >= 0; s -= 4)
+		if (pa >> s || s == 0)
+			line[n++] = hex[(pa >> s) & 0xf];
+	line[n] = 0;
+}
+
 /* build.sh appends the payload to the Image at the first 4K boundary after _end */
 extern char _end[];
 
@@ -179,6 +201,7 @@ const char *loader_boot(uintptr_t dtb)
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
+	append_tramp(ba->CommandLine);
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 

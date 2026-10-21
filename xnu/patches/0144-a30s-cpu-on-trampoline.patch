@@ -1,0 +1,66 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 44cb0f7..e03f768 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -21,6 +21,7 @@
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ extern "C" void sweet_gic_send_sgi(unsigned int cpu, uint64_t mpidr);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -232,6 +233,25 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++	uint64_t tramp = 0;
++	if (PE_parse_boot_argn("sweettramp", &tramp, sizeof(tramp)) && tramp != 0) {
++		/*
++		 * a30s: Samsung's PSCI 0.1 CPU_ON returns 0 but never starts a core
++		 * whose entry point is above 4 GiB, and this kernel runs at
++		 * 0x8_80000000. The shim leaves a trampoline below 4 GiB
++		 * (ldr x1, [pc, #8]; br x1; .quad target): put our entry point in
++		 * its slot, uncached, and hand CPU_ON the trampoline instead.
++		 */
++		vm_offset_t page = ml_io_map((vm_offset_t)(tramp & ~(uint64_t)PAGE_MASK), PAGE_SIZE);
++		if (page == 0) {
++			panic("SWEET CPU: cannot map the CPU_ON trampoline at 0x%llx", tramp);
++		}
++		*(volatile uint64_t *)(page + (tramp & PAGE_MASK) + 8) = entry;
++		__builtin_arm_dsb(DSB_SY);
++		IOLog("SWEET CPU: cpu=%u entry 0x%llx through the trampoline at 0x%llx\n",
++		    getCPUNumber(), (uint64_t)entry, tramp);
++		entry = (vm_offset_t)tramp;
++	}
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index ac6e323..3998262 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -89,6 +89,10 @@ sweet_gicv2_init_cpu(void)
+ 
+ 	/* GICD_ITARGETSR0..7 are read-only: each byte is this CPU's own bit. */
+ 	uint32_t mask = gicd_read32(GICD_ITARGETSR) & 0xff;
++	/* A uniprocessor GIC (QEMU virt with one CPU) reads ITARGETSR as zero. */
++	if (mask == 0 && GICD_TYPER_CPUNUMBER(gicd_read32(GICD_TYPER)) == 0) {
++		mask = 1;
++	}
+ 	unsigned int cpu = ml_get_cpu_number_local();
+ 	if (mask == 0 || cpu >= MAX_CPUS) {
+ 		panic("%s: core %u has no GIC CPU interface (mask 0x%x)", __func__, cpu, mask);
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 77a27a9..4084af9 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -98,6 +98,8 @@
+  * is then GICD base/size, GICC base/size. Non-secure view: EnableGrp1 is
+  * bit 0 of GICD_CTLR and GICC_CTLR.
+  */
++#define GICD_TYPER                              0x004
++#define GICD_TYPER_CPUNUMBER(t)                 (((t) >> 5) & 0x7)
+ #define GICD_ISENABLER                          0x100
+ #define GICD_IPRIORITYR                         0x400
+ #define GICD_ITARGETSR                          0x800
