@@ -1,0 +1,819 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 143db60..bf6084f 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -17,6 +17,10 @@
+  * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
+  * against the partition bounds again right before it is issued, so nothing
+  * outside the named partition can be written.
++ *
++ * a30s: with an ADT /sweet-mmc node instead of /sweet-ufs the same disk sits
++ * on the eMMC behind the Exynos DesignWare host (see "eMMC transport" below);
++ * everything above the transport is shared.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -112,6 +116,14 @@ static struct {
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
++	/* eMMC transport (ADT /sweet-mmc) */
++	bool mmc;
++	uint32_t mmc_rca;
++	uint32_t mmc_fifo;                      /* data FIFO offset */
++	uint32_t mmc_shift;                     /* log2 of the FIFO width in bytes */
++	uint32_t mmc_hold;                      /* CMD.use_hold_reg or 0 */
++	bool mmc_cache;                         /* card cache on: flush on sync */
++	uint64_t mmc_sectors;                   /* user area, 512-byte sectors */
+ } su;
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+@@ -256,6 +268,494 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	return 0;
+ }
+ 
++/*
++ * eMMC transport (a30s). The Exynos 7904's eMMC sits behind a DesignWare
++ * mobile storage host (dwmmc0, Exynos 7 flavour with the SMU). S-BOOT leaves
++ * the card initialised and selected, at the bus width, timing and sample
++ * phase it chose; like the UFS path this reuses that state and never touches
++ * clocks or the card's bus settings. Polled PIO through the data FIFO, with
++ * the host's interrupts and internal DMA off, so no cache maintenance; the
++ * bounce buffer stays the only data buffer. 512-byte sectors, eight per
++ * 4 KiB device block; multi-block commands are preceded by CMD23.
++ */
++#define MMC_CTRL        0x000
++#define MMC_CLKDIV      0x008
++#define MMC_CLKENA      0x010
++#define MMC_TMOUT       0x014
++#define MMC_CTYPE       0x018
++#define MMC_BLKSIZ      0x01c
++#define MMC_BYTCNT      0x020
++#define MMC_INTMASK     0x024
++#define MMC_CMDARG      0x028
++#define MMC_CMD         0x02c
++#define MMC_RESP0       0x030
++#define MMC_RINTSTS     0x044
++#define MMC_STATUS      0x048
++#define MMC_USRID       0x068
++#define MMC_VERID       0x06c
++#define MMC_HCON        0x070
++#define MMC_UHS_REG     0x074
++#define MMC_BMOD        0x080
++#define MMC_IDSTS64     0x090                   /* 64-bit IDMAC layout */
++#define MMC_IDINTEN64   0x094
++#define MMC_CLKSEL64    0x0a8                   /* Exynos 7 */
++#define MMC_FORCE_CLK_STOP 0x0b0
++#define MMC_CDTHRCTL    0x100
++#define MMC_DDR_REG     0x10c
++#define MMC_HS400_DQS_EN 0x180
++#define MMC_MPSECURITY  0x1010
++#define MMC_MPSBEGIN0   0x1200                  /* Exynos SMU, region 0 */
++#define MMC_MPSEND0     0x1204
++#define MMC_MPSCTRL0    0x120c
++
++#define MMC_CTRL_FIFO_RESET     (1u << 1)
++#define MMC_CTRL_DMA_RESET      (1u << 2)
++#define MMC_CTRL_INT_ENABLE     (1u << 4)
++#define MMC_CTRL_DMA_ENABLE     (1u << 5)
++#define MMC_CTRL_USE_IDMAC      (1u << 25)
++#define MMC_BMOD_SWR            (1u << 0)
++#define MMC_BMOD_FB             (1u << 1)
++#define MMC_BMOD_DE             (1u << 7)
++
++#define MMC_INT_RE              (1u << 1)
++#define MMC_INT_CMD_DONE        (1u << 2)
++#define MMC_INT_DTO             (1u << 3)
++#define MMC_INT_TXDR            (1u << 4)
++#define MMC_INT_RXDR            (1u << 5)
++#define MMC_INT_RCRC            (1u << 6)
++#define MMC_INT_DCRC            (1u << 7)
++#define MMC_INT_RTO             (1u << 8)
++#define MMC_INT_DRTO            (1u << 9)
++#define MMC_INT_FRUN            (1u << 11)
++#define MMC_INT_HLE             (1u << 12)
++#define MMC_INT_SBE             (1u << 13)
++#define MMC_INT_EBE             (1u << 15)
++#define MMC_INT_CMD_ERR         (MMC_INT_RE | MMC_INT_RCRC | MMC_INT_RTO | MMC_INT_HLE)
++#define MMC_INT_DATA_ERR        (MMC_INT_DCRC | MMC_INT_DRTO | MMC_INT_FRUN | MMC_INT_SBE | MMC_INT_EBE)
++
++#define MMC_CMD_RESP_EXP        (1u << 6)
++#define MMC_CMD_RESP_CRC        (1u << 8)
++#define MMC_CMD_DAT_EXP         (1u << 9)
++#define MMC_CMD_DAT_WR          (1u << 10)
++#define MMC_CMD_PRV_DAT_WAIT    (1u << 13)
++#define MMC_CMD_STOP            (1u << 14)
++#define MMC_CMD_USE_HOLD        (1u << 29)
++#define MMC_CMD_START           (1u << 31)
++#define MMC_R1                  (MMC_CMD_RESP_EXP | MMC_CMD_RESP_CRC)
++
++#define MMC_STATUS_BUSY         (1u << 9)
++#define MMC_STATUS_FCNT(s)      (((s) >> 17) & 0x1fff)
++#define MMC_STATUS_DMA_REQ      (1u << 31)
++
++/* SMU region 0: whole card, normal world read/write (Linux's config_smu). */
++#define MMC_MPS_NS_RW           ((1u << 6) | (1u << 5) | (1u << 4) | (1u << 0))
++
++/* R1 card status */
++#define R1_STATE(r)             (((r) >> 9) & 0xf)
++#define R1_STATE_STBY           3
++#define R1_STATE_TRAN           4
++#define R1_SWITCH_ERROR         (1u << 7)
++#define R1_ERRORS               0xe4380000u     /* out of range, address, block length, WP, ECC, CC, error */
++
++#define MMC_SECTOR              512u
++#define MMC_PER_BLOCK           (UFS_BLOCK / MMC_SECTOR)
++#define MMC_FIFO_DEPTH          64u             /* entries: exynos7885.dtsi fifo-depth */
++#define MMC_CMD_TIMEOUT_NS      (100ull * NSEC_PER_MSEC)
++#define MMC_DATA_TIMEOUT_NS     (5ull * NSEC_PER_SEC)
++
++static uint64_t
++mmc_deadline(uint64_t ns)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(ns, &t);
++	return mach_absolute_time() + t;
++}
++
++static int
++mmc_wait_busy(uint64_t ns)
++{
++	uint64_t deadline = mmc_deadline(ns);
++	while (ufs_rd(MMC_STATUS) & MMC_STATUS_BUSY) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET MMC: card still busy (status 0x%x)\n", ufs_rd(MMC_STATUS));
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	return 0;
++}
++
++static int
++mmc_ctrl_reset(uint32_t bits)
++{
++	uint64_t deadline = mmc_deadline(MMC_CMD_TIMEOUT_NS);
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | bits);
++	while (ufs_rd(MMC_CTRL) & bits) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET MMC: reset 0x%x stuck (ctrl 0x%x)\n", bits, ufs_rd(MMC_CTRL));
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++/* One command, the short response in *resp. Data, if any, is the caller's. */
++static int
++mmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t *resp)
++{
++	/* Databook: a new command waits for the card to leave busy (not CMD13/CMD12). */
++	if (idx != 13 && !(flags & MMC_CMD_STOP)) {
++		int error = mmc_wait_busy(MMC_DATA_TIMEOUT_NS);
++		if (error) {
++			return error;
++		}
++	}
++	/* Writing CMD while the host still holds the last one raises HLE. */
++	uint64_t deadline = mmc_deadline(MMC_CMD_TIMEOUT_NS);
++	while (ufs_rd(MMC_CMD) & MMC_CMD_START) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET MMC: host still holds cmd 0x%x\n", ufs_rd(MMC_CMD));
++			return EBUSY;
++		}
++	}
++	ufs_wr(MMC_RINTSTS, ~0u);
++	ufs_wr(MMC_CMDARG, arg);
++	__builtin_arm_dsb(0xf);
++	ufs_wr(MMC_CMD, MMC_CMD_START | su.mmc_hold | flags | idx);
++
++	deadline = mmc_deadline(MMC_CMD_TIMEOUT_NS);
++	uint32_t st;
++	while (!((st = ufs_rd(MMC_RINTSTS)) & (MMC_INT_CMD_DONE | MMC_INT_HLE))) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET MMC: CMD%u timed out (cmd 0x%x rintsts 0x%x status 0x%x)\n",
++			    idx, ufs_rd(MMC_CMD), st, ufs_rd(MMC_STATUS));
++			return ETIMEDOUT;
++		}
++	}
++	ufs_wr(MMC_RINTSTS, st & (MMC_INT_CMD_DONE | MMC_INT_CMD_ERR));
++	if (st & MMC_INT_CMD_ERR) {
++		printf("SWEET MMC: CMD%u arg 0x%x failed (rintsts 0x%x)\n", idx, arg, st);
++		return (st & MMC_INT_RTO) ? ETIMEDOUT : EIO;
++	}
++	if (resp) {
++		*resp = ufs_rd(MMC_RESP0);
++	}
++	return 0;
++}
++
++static int
++mmc_status(uint32_t *r1)
++{
++	return mmc_cmd(13, su.mmc_rca << 16, MMC_R1, r1);
++}
++
++/* After a failed transfer: CMD12 (the card may still be sending or receiving), empty FIFO. */
++static void
++mmc_abort(void)
++{
++	uint32_t r1 = 0;
++	(void)mmc_cmd(12, 0, MMC_R1 | MMC_CMD_STOP, &r1);
++	(void)mmc_wait_busy(MMC_DATA_TIMEOUT_NS);
++	(void)mmc_ctrl_reset(MMC_CTRL_FIFO_RESET);
++	ufs_wr(MMC_RINTSTS, ~0u);
++}
++
++/*
++ * Data command idx with argument arg moving nsect sectors between buf and the
++ * card through the FIFO; CMD18/CMD25 get a CMD23 first, so no stop is needed.
++ */
++static int
++mmc_xfer(uint32_t idx, uint32_t arg, uint32_t nsect, bool write, void *buf)
++{
++	uint32_t r1 = 0, st = 0;
++	int error;
++
++	if (idx == 18 || idx == 25) {
++		error = mmc_cmd(23, nsect, MMC_R1, &r1);
++		if (error) {
++			return error;
++		}
++	}
++	if (MMC_STATUS_FCNT(ufs_rd(MMC_STATUS)) && (error = mmc_ctrl_reset(MMC_CTRL_FIFO_RESET))) {
++		return error;
++	}
++	ufs_wr(MMC_BLKSIZ, MMC_SECTOR);
++	ufs_wr(MMC_BYTCNT, nsect * MMC_SECTOR);
++	error = mmc_cmd(idx, arg, MMC_R1 | MMC_CMD_DAT_EXP | MMC_CMD_PRV_DAT_WAIT |
++	    (write ? MMC_CMD_DAT_WR : 0), &r1);
++	if (!error && (r1 & R1_ERRORS)) {
++		printf("SWEET MMC: CMD%u arg 0x%x: card status 0x%x\n", idx, arg, r1);
++		error = EIO;
++	}
++	if (error) {
++		mmc_abort();
++		return error;
++	}
++
++	/*
++	 * A 64-bit FIFO entry is moved as two 32-bit accesses, low word first,
++	 * like Samsung's kernel for this SoC (MMC_DW_FORCE_32BIT_SFR_RW).
++	 */
++	vm_offset_t fifo = su.regs + su.mmc_fifo;
++	bool wide = su.mmc_shift == 3;
++	uint32_t left = (nsect * MMC_SECTOR) >> su.mmc_shift;
++	uint32_t *w = (uint32_t *)buf;
++	uint64_t deadline = mmc_deadline(MMC_DATA_TIMEOUT_NS);
++	while (left) {
++		st = ufs_rd(MMC_RINTSTS);
++		if (st & MMC_INT_DATA_ERR) {
++			break;
++		}
++		uint32_t fcnt = MMC_STATUS_FCNT(ufs_rd(MMC_STATUS));
++		uint32_t n = MIN(left, write ? (fcnt < MMC_FIFO_DEPTH ? MMC_FIFO_DEPTH - fcnt : 0) : fcnt);
++		if (n == 0) {
++			if (mach_absolute_time() > deadline) {
++				break;
++			}
++			continue;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			if (write) {
++				*(volatile uint32_t *)fifo = *w++;
++				if (wide) {
++					*(volatile uint32_t *)(fifo + 4) = *w++;
++				}
++			} else {
++				*w++ = *(volatile uint32_t *)fifo;
++				if (wide) {
++					*w++ = *(volatile uint32_t *)(fifo + 4);
++				}
++			}
++		}
++		left -= n;
++		ufs_wr(MMC_RINTSTS, write ? MMC_INT_TXDR : MMC_INT_RXDR);
++	}
++	while (!left && !((st = ufs_rd(MMC_RINTSTS)) & (MMC_INT_DTO | MMC_INT_DATA_ERR))) {
++		if (mach_absolute_time() > deadline) {
++			break;
++		}
++	}
++	if (left || !(st & MMC_INT_DTO) || (st & MMC_INT_DATA_ERR)) {
++		printf("SWEET MMC: CMD%u arg 0x%x x%u %s failed: rintsts 0x%x status 0x%x, %u FIFO words left\n",
++		    idx, arg, nsect, write ? "write" : "read", st, ufs_rd(MMC_STATUS), left);
++		mmc_abort();
++		return (st & MMC_INT_DATA_ERR) ? EIO : ETIMEDOUT;
++	}
++	ufs_wr(MMC_RINTSTS, ~0u);
++	if (write) {
++		/* Programming: data busy until the card is done, then check what it says. */
++		error = mmc_wait_busy(MMC_DATA_TIMEOUT_NS);
++		if (!error) {
++			error = mmc_status(&r1);
++		}
++		if (!error && ((r1 & R1_ERRORS) || R1_STATE(r1) != R1_STATE_TRAN)) {
++			printf("SWEET MMC: write at 0x%x: card status 0x%x\n", arg, r1);
++			error = EIO;
++		}
++	}
++	return error;
++}
++
++/* nsect sectors at sector to/from the bounce buffer, inside the user area. */
++static int
++mmc_rw_sectors(uint64_t sector, uint32_t nsect, bool write)
++{
++	if (nsect == 0 || nsect > BOUNCE_SIZE / MMC_SECTOR || sector >= su.mmc_sectors ||
++	    nsect > su.mmc_sectors - sector || sector + nsect - 1 > UINT32_MAX) {
++		return EINVAL;
++	}
++	uint32_t idx = write ? (nsect > 1 ? 25 : 24) : (nsect > 1 ? 18 : 17);
++	return mmc_xfer(idx, (uint32_t)sector, nsect, write, (void *)(su.dma + DMA_BOUNCE));
++}
++
++/* CMD6: mode 2 clears bits of EXT_CSD[index], 3 writes the byte. */
++static int
++mmc_switch(uint8_t mode, uint8_t index, uint8_t value, uint64_t busy_ns)
++{
++	uint32_t r1 = 0;
++	int error = mmc_cmd(6, (uint32_t)mode << 24 | (uint32_t)index << 16 | (uint32_t)value << 8,
++	    MMC_R1, &r1);
++	if (!error) {
++		error = mmc_wait_busy(busy_ns);
++	}
++	if (!error) {
++		error = mmc_status(&r1);
++	}
++	if (!error && (r1 & (R1_ERRORS | R1_SWITCH_ERROR))) {
++		printf("SWEET MMC: SWITCH %u of EXT_CSD[%u] to 0x%x: card status 0x%x\n",
++		    mode, index, value, r1);
++		error = EIO;
++	}
++	return error;
++}
++
++static int
++mmc_flush(void)
++{
++	/* EXT_CSD[32] FLUSH_CACHE */
++	return su.mmc_cache ? mmc_switch(3, 32, 1, 30ull * NSEC_PER_SEC) : 0;
++}
++
++static int
++mmc_take_over_host(void)
++{
++	uint32_t verid = ufs_rd(MMC_VERID), hcon = ufs_rd(MMC_HCON), ctrl = ufs_rd(MMC_CTRL);
++	uint32_t bmod = ufs_rd(MMC_BMOD), clksel = ufs_rd(MMC_CLKSEL64);
++	uint32_t mps = ufs_rd(MMC_MPSCTRL0);
++	int error;
++
++	printf("SWEET MMC: verid 0x%x hcon 0x%x ctrl 0x%x bmod 0x%x status 0x%x rintsts 0x%x\n",
++	    verid, hcon, ctrl, bmod, ufs_rd(MMC_STATUS), ufs_rd(MMC_RINTSTS));
++	printf("SWEET MMC: clkdiv 0x%x clkena 0x%x ctype 0x%x uhs 0x%x ddr 0x%x clksel 0x%x cdthr 0x%x\n",
++	    ufs_rd(MMC_CLKDIV), ufs_rd(MMC_CLKENA), ufs_rd(MMC_CTYPE), ufs_rd(MMC_UHS_REG),
++	    ufs_rd(MMC_DDR_REG), clksel, ufs_rd(MMC_CDTHRCTL));
++	printf("SWEET MMC: last cmd 0x%x arg 0x%x, clkstop 0x%x dqs 0x%x, smu sec 0x%x ctrl 0x%x 0x%x-0x%x\n",
++	    ufs_rd(MMC_CMD), ufs_rd(MMC_CMDARG), ufs_rd(MMC_FORCE_CLK_STOP), ufs_rd(MMC_HS400_DQS_EN),
++	    ufs_rd(MMC_MPSECURITY), mps, ufs_rd(MMC_MPSBEGIN0), ufs_rd(MMC_MPSEND0));
++	if ((verid >> 16) != 0x5342) {          /* "SB" (Synopsys) */
++		printf("SWEET MMC: no DesignWare host here\n");
++		return ENXIO;
++	}
++	if (!(ufs_rd(MMC_CLKENA) & 1)) {
++		printf("SWEET MMC: card clock is off\n");
++		return ENXIO;
++	}
++	switch ((hcon >> 7) & 7) {              /* host data width */
++	case 1:
++		su.mmc_shift = 2;
++		break;
++	case 2:
++		su.mmc_shift = 3;
++		break;
++	default:
++		printf("SWEET MMC: unsupported FIFO width\n");
++		return ENXIO;
++	}
++	su.mmc_fifo = (verid & 0xffff) < 0x240a ? 0x100 : 0x200;
++	/* Exynos: the hold register is bypassed when no drive phase shift is set (Linux). */
++	su.mmc_hold = ((clksel >> 16) & 7) ? MMC_CMD_USE_HOLD : 0;
++
++	/*
++	 * Polled PIO: interrupts and the internal DMA off (Linux's IDMAC
++	 * teardown), then empty the FIFO. No controller reset: that would need
++	 * the clock registers re-sent to the card clock domain.
++	 */
++	ufs_wr(MMC_INTMASK, 0);
++	ufs_wr(MMC_CTRL, ctrl & ~(MMC_CTRL_INT_ENABLE | MMC_CTRL_DMA_ENABLE | MMC_CTRL_USE_IDMAC));
++	error = mmc_ctrl_reset(MMC_CTRL_DMA_RESET);
++	if (error) {
++		return error;
++	}
++	ufs_wr(MMC_BMOD, (bmod & ~(MMC_BMOD_DE | MMC_BMOD_FB)) | MMC_BMOD_SWR);
++	ufs_wr(MMC_IDSTS64, 0x337);
++	ufs_wr(MMC_IDINTEN64, 0);
++	uint64_t deadline = mmc_deadline(MMC_CMD_TIMEOUT_NS);
++	while (ufs_rd(MMC_STATUS) & MMC_STATUS_DMA_REQ) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET MMC: DMA request stuck (status 0x%x)\n", ufs_rd(MMC_STATUS));
++			return ETIMEDOUT;
++		}
++	}
++	error = mmc_ctrl_reset(MMC_CTRL_FIFO_RESET);
++	if (error) {
++		return error;
++	}
++	ufs_wr(MMC_RINTSTS, ~0u);
++	ufs_wr(MMC_TMOUT, 0xffffffff);
++	if ((mps & MMC_MPS_NS_RW) != MMC_MPS_NS_RW || ufs_rd(MMC_MPSBEGIN0) != 0 ||
++	    ufs_rd(MMC_MPSEND0) != 0xffffffff) {
++		ufs_wr(MMC_MPSBEGIN0, 0);
++		ufs_wr(MMC_MPSEND0, 0xffffffff);
++		ufs_wr(MMC_MPSCTRL0, MMC_MPS_NS_RW);
++		printf("SWEET MMC: smu now ctrl 0x%x 0x%x-0x%x\n", ufs_rd(MMC_MPSCTRL0),
++		    ufs_rd(MMC_MPSBEGIN0), ufs_rd(MMC_MPSEND0));
++	}
++
++	/* The card: S-BOOT's RCA, 1 like Linux's. */
++	uint32_t r1 = 0;
++	for (su.mmc_rca = 1; su.mmc_rca <= 3; su.mmc_rca++) {
++		if ((error = mmc_status(&r1)) == 0) {
++			break;
++		}
++	}
++	if (error) {
++		printf("SWEET MMC: no card answers CMD13\n");
++		return ENXIO;
++	}
++	printf("SWEET MMC: card rca %u status 0x%x (state %u)\n", su.mmc_rca, r1, R1_STATE(r1));
++	if (R1_STATE(r1) == R1_STATE_STBY) {
++		error = mmc_cmd(7, su.mmc_rca << 16, MMC_R1, &r1);
++		if (!error) {
++			error = mmc_wait_busy(MMC_DATA_TIMEOUT_NS);
++		}
++	} else if (R1_STATE(r1) != R1_STATE_TRAN) {
++		mmc_abort();
++	}
++	if (!error) {
++		error = mmc_status(&r1);
++	}
++	if (error || R1_STATE(r1) != R1_STATE_TRAN) {
++		printf("SWEET MMC: card not in transfer state (status 0x%x)\n", r1);
++		return error ? error : EIO;
++	}
++
++	/* EXT_CSD (CMD8), one sector: always fits the FIFO. */
++	const uint8_t *ext = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	error = mmc_xfer(8, 0, 1, false, (void *)(su.dma + DMA_BOUNCE));
++	if (error) {
++		/* Stock Android runs the card with command queueing, which refuses CMD8. */
++		printf("SWEET MMC: EXT_CSD read failed, retrying with command queueing off\n");
++		error = mmc_switch(3, 15, 0, MMC_DATA_TIMEOUT_NS);
++		if (!error) {
++			error = mmc_xfer(8, 0, 1, false, (void *)(su.dma + DMA_BOUNCE));
++		}
++		if (error) {
++			return error;
++		}
++	}
++	su.mmc_sectors = (uint64_t)ext[212] | (uint64_t)ext[213] << 8 |
++	    (uint64_t)ext[214] << 16 | (uint64_t)ext[215] << 24;
++	su.mmc_cache = ext[33] & 1;
++	uint8_t timing = ext[185] & 0xf, part = ext[179];
++	printf("SWEET MMC: EXT_CSD rev %u, %llu MiB, bus %u timing %u part 0x%x cache %u cmdq %u\n",
++	    ext[192], su.mmc_sectors >> 11, ext[183], timing, part, ext[33], ext[15]);
++	if (su.mmc_sectors == 0) {
++		return ENXIO;
++	}
++	/*
++	 * HS200/HS400: the card clock must not stop inside a block, so the host
++	 * starts a block only with room for all of it in the FIFO (Linux's
++	 * dw_mci_ctrl_thld; 512 bytes is exactly the FIFO).
++	 */
++	if (timing >= 2) {
++		uint32_t thr = (MMC_SECTOR << 16) | (1u << 0);
++		if (timing == 3 && (verid & 0xffff) >= 0x280a) {
++			thr |= 1u << 2;
++		}
++		ufs_wr(MMC_CDTHRCTL, thr);
++	}
++	/* Plain block commands: command queueing off (EXT_CSD[15] CMDQ_MODE_EN). */
++	if (ext[15] & 1) {
++		error = mmc_switch(3, 15, 0, MMC_DATA_TIMEOUT_NS);
++		if (error) {
++			return error;
++		}
++		printf("SWEET MMC: command queueing turned off\n");
++	}
++	/*
++	 * The user area, not a boot partition or RPMB: PARTITION_ACCESS = 0,
++	 * the boot configuration bits written back unchanged.
++	 */
++	if (part & 7) {
++		error = mmc_switch(3, 179, part & ~7, MMC_DATA_TIMEOUT_NS);
++		if (error) {
++			return error;
++		}
++		printf("SWEET MMC: switched to the user area\n");
++	}
++	return 0;
++}
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -263,6 +763,9 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+ 	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
+ 		return EINVAL;
+ 	}
++	if (su.mmc) {
++		return mmc_rw_sectors(lba * MMC_PER_BLOCK, count * MMC_PER_BLOCK, false);
++	}
+ 	uint8_t cdb[10] = {
+ 		0x28, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -277,9 +780,24 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+  * a watchdog thread re-reads them and panics the moment they change.
+  */
+ static uint64_t gpt_alt;                /* backup header LBA (last LBA of LUN0) */
++static uint64_t gpt_fence;              /* first device block of the backup GPT */
+ static uint32_t gpt_hcrc, gpt_ecrc, gpt_bhcrc;
+ static int gpt_chan;
+ 
++/* The GPT's logical block: 4 KiB on UFS, a 512-byte sector on eMMC. */
++static uint32_t
++gpt_lbsize(void)
++{
++	return su.mmc ? MMC_SECTOR : UFS_BLOCK;
++}
++
++/* n GPT logical blocks at lba into the bounce buffer. */
++static int
++gpt_read(uint64_t lba, uint32_t n)
++{
++	return su.mmc ? mmc_rw_sectors(lba, n, false) : ufs_read_blocks(lba, n);
++}
++
+ /*
+  * WRITE(10) of count device blocks from the bounce buffer to lba. The range
+  * must lie inside the partition: this is the only place data goes out.
+@@ -290,10 +808,13 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+ 	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX ||
+-	    lba < 6 || (gpt_alt && lba + count - 1 >= gpt_alt - 4)) {
++	    lba < 6 || !gpt_fence || lba + count - 1 >= gpt_fence) {
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
++	if (su.mmc) {
++		return mmc_rw_sectors(lba * MMC_PER_BLOCK, count * MMC_PER_BLOCK, true);
++	}
+ 	uint8_t cdb[10] = {
+ 		0x2a, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -306,6 +827,9 @@ static int
+ ufs_sync_cache(void)
+ {
+ 	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
++	if (su.mmc) {
++		return mmc_flush();
++	}
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
+@@ -313,7 +837,8 @@ static int
+ ufs_find_partition(const char *want)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+-	int error = ufs_read_blocks(1, 1);
++	uint32_t lb = gpt_lbsize(), per = UFS_BLOCK / lb;
++	int error = gpt_read(1, 1);
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -333,10 +858,20 @@ ufs_find_partition(const char *want)
+ 		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
+ 		return ENXIO;
+ 	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	uint32_t ent_lbs = (nent * esz + lb - 1) / lb;
++	if (gpt_alt < ent_lbs + 1) {
++		return ENXIO;
++	}
++	/* The backup entries sit right below the backup header. */
++	gpt_fence = (gpt_alt - ent_lbs) / per;
++	error = gpt_read(entry_lba, ent_lbs);
+ 	if (error) {
+ 		return error;
+ 	}
++	uint32_t list = 0;
++	PE_parse_boot_argn("mmcgpt", &list, sizeof(list));
++	uint64_t first = 0, last = 0;
++	uint32_t used = 0, found = 0;
+ 	for (uint32_t i = 0; i < nent; i++) {
+ 		const uint8_t *e = b + i * esz;
+ 		char name[37];
+@@ -349,26 +884,40 @@ ufs_find_partition(const char *want)
+ 			name[c] = (char)ch;
+ 		}
+ 		name[c] = 0;
+-		if (strcmp(name, want) != 0) {
++		uint64_t f, l;
++		memcpy(&f, e + 32, 8);
++		memcpy(&l, e + 40, 8);
++		if (f == 0 && l == 0) {
+ 			continue;
+ 		}
+-		uint64_t first, last;
+-		memcpy(&first, e + 32, 8);
+-		memcpy(&last, e + 40, 8);
+-		if (last < first) {
+-			return ENXIO;
++		used++;
++		if (list) {
++			printf("GPT %u %s %#llx+%#llx\n", i + 1, name, f, l - f + 1);
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
+-		if (ufs_read_blocks(gpt_alt, 1) == 0 && memcmp(b, "EFI PART", 8) == 0) {
+-			memcpy(&gpt_bhcrc, b + 16, 4);
++		if (!found && strcmp(name, want) == 0) {
++			found = i + 1;
++			first = f;
++			last = l;
+ 		}
+-		printf("SWEET UFS: GPT LUN0 hcrc %#x ecrc %#x backup@%#llx hcrc %#x\n",
+-		    gpt_hcrc, gpt_ecrc, gpt_alt, gpt_bhcrc);
+-		return 0;
+ 	}
+-	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+-	return ENOENT;
++	if (!found) {
++		printf("SWEET UFS: no GPT partition named \"%s\" (%u in use)\n", want, used);
++		return ENOENT;
++	}
++	/* eMMC: whole 4 KiB device blocks only. */
++	if (last < first || (first % per) || (last - first + 1) / per == 0) {
++		printf("SWEET UFS: partition %u \"%s\" at %#llx-%#llx is not 4 KiB aligned\n",
++		    found, want, first, last);
++		return ENXIO;
++	}
++	su.first_block = first / per;
++	su.nblocks = (last - first + 1) / per;
++	if (gpt_read(gpt_alt, 1) == 0 && memcmp(b, "EFI PART", 8) == 0) {
++		memcpy(&gpt_bhcrc, b + 16, 4);
++	}
++	printf("SWEET UFS: GPT LUN0 hcrc %#x ecrc %#x backup@%#llx hcrc %#x, partition %u of %u\n",
++	    gpt_hcrc, gpt_ecrc, gpt_alt, gpt_bhcrc, found, used);
++	return 0;
+ }
+ 
+ /*
+@@ -392,9 +941,10 @@ ufs_lookup_part(const char *want, unsigned *slot)
+ 	if (part_cached == sizeof(part_cache) / sizeof(part_cache[0]) || strlen(want) > 36) {
+ 		return ENOSPC;
+ 	}
+-	for (uint8_t lun = 0; lun < 6; lun++) {
++	uint32_t lb = gpt_lbsize(), per = UFS_BLOCK / lb;
++	for (uint8_t lun = 0; lun < (su.mmc ? 1 : 6); lun++) {
+ 		su.lun = lun;
+-		if (ufs_read_blocks(1, 1) != 0 || memcmp(b, "EFI PART", 8) != 0) {
++		if (gpt_read(1, 1) != 0 || memcmp(b, "EFI PART", 8) != 0) {
+ 			continue;
+ 		}
+ 		uint64_t entry_lba;
+@@ -403,7 +953,7 @@ ufs_lookup_part(const char *want, unsigned *slot)
+ 		memcpy(&nent, b + 80, 4);
+ 		memcpy(&esz, b + 84, 4);
+ 		if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE ||
+-		    ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK) != 0) {
++		    gpt_read(entry_lba, (nent * esz + lb - 1) / lb) != 0) {
+ 			continue;
+ 		}
+ 		for (uint32_t i = 0; i < nent; i++) {
+@@ -421,16 +971,17 @@ ufs_lookup_part(const char *want, unsigned *slot)
+ 			uint64_t first, last;
+ 			memcpy(&first, e + 32, 8);
+ 			memcpy(&last, e + 40, 8);
+-			if (strcmp(name, want) != 0 || last < first) {
++			if (strcmp(name, want) != 0 || last < first || (first % per) ||
++			    (last - first + 1) / per == 0) {
+ 				continue;
+ 			}
+ 			unsigned k = part_cached++;
+ 			strlcpy(part_cache[k].name, want, sizeof(part_cache[k].name));
+ 			part_cache[k].lun = lun;
+-			part_cache[k].first = first;
+-			part_cache[k].nblocks = last - first + 1;
++			part_cache[k].first = first / per;
++			part_cache[k].nblocks = (last - first + 1) / per;
+ 			printf("SWEET UFS: partition %s: LUN %u blocks 0x%llx+0x%llx (read-only)\n",
+-			    want, lun, first, last - first + 1);
++			    want, lun, part_cache[k].first, part_cache[k].nblocks);
+ 			*slot = k;
+ 			return 0;
+ 		}
+@@ -716,12 +1267,12 @@ sweet_gpt_watch(__unused void *arg, __unused wait_result_t wr)
+ 		uint32_t h = 0, e = 0, bh = 0;
+ 		bool ok;
+ 		lck_mtx_lock(&sweet_ufs_lock);
+-		ok = ufs_read_blocks(1, 1) == 0 && memcmp(b, "EFI PART", 8) == 0;
++		ok = gpt_read(1, 1) == 0 && memcmp(b, "EFI PART", 8) == 0;
+ 		if (ok) {
+ 			memcpy(&h, b + 16, 4);
+ 			memcpy(&e, b + 88, 4);
+ 		}
+-		if (ok && gpt_bhcrc && ufs_read_blocks(gpt_alt, 1) == 0) {
++		if (ok && gpt_bhcrc && gpt_read(gpt_alt, 1) == 0) {
+ 			if (memcmp(b, "EFI PART", 8) == 0) {
+ 				memcpy(&bh, b + 16, 4);
+ 			}
+@@ -745,10 +1296,17 @@ sweet_ufs_init(void)
+ 	char want[64] = "userdata";
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+-	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess) {
++		/* a30s: the eMMC transport */
++		su.mmc = SecureDTLookupEntry(NULL, "/sweet-mmc", &node) == kSuccess;
++		if (!su.mmc) {
++			printf("SWEET UFS: no /sweet-ufs or /sweet-mmc node in the device tree\n");
++			return ENXIO;
++		}
++	}
++	if (SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+-		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
++		printf("SWEET UFS: no reg in the %s node\n", su.mmc ? "/sweet-mmc" : "/sweet-ufs");
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+@@ -775,8 +1333,8 @@ sweet_ufs_init(void)
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+-	error = ufs_take_over_host();
+-	if (!error) {
++	error = su.mmc ? mmc_take_over_host() : ufs_take_over_host();
++	if (!error && !su.mmc) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+@@ -785,7 +1343,30 @@ sweet_ufs_init(void)
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++	if (!error && su.mmc) {
++		/*
++		 * a30s bring-up: what the partition starts with (an ext4 or f2fs
++		 * superblock at 1 KiB, HFS+ "H+" at 1 KiB) and how fast 1 MiB of
++		 * PIO reads is.
++		 */
++		const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE) + 1024;
++		uint64_t t0 = mach_absolute_time(), ns = 0;
++		error = ufs_read_blocks(su.first_block, (uint32_t)MIN(su.nblocks, BOUNCE_SIZE / UFS_BLOCK));
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		if (!error) {
++			printf("SWEET MMC: @1K %02x%02x%02x%02x %02x%02x%02x%02x @1K+56 %02x%02x, 1 MiB in %llu us\n",
++			    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[56], b[57], ns / 1000);
++		}
++	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
++	uint32_t hold = 0;
++	if (su.mmc && PE_parse_boot_argn("mmchold", &hold, sizeof(hold)) && hold) {
++		/* Keep the lines above on the screen: no root mount, no panic after them. */
++		printf("SWEET MMC: %s (%d), holding here (mmchold=1)\n", error ? "FAILED" : "ok", error);
++		for (;;) {
++			(void)tsleep(&hold, PZERO, "mmchold", 0);
++		}
++	}
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -804,15 +1385,20 @@ sweet_ufs_init(void)
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ 	su.writable = (rw != 0);
+ 	su.ready = true;
+-	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+-	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+-	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	printf("SWEET UFS: \"%s\" on %s %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	    want, su.mmc ? "eMMC rca" : "LUN", su.mmc ? su.mmc_rca : su.lun, su.first_block,
++	    su.nblocks * UFS_BLOCK >> 20, su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	thread_t gpt_thread;
+ 	if (kernel_thread_start(sweet_gpt_watch, NULL, &gpt_thread) == KERN_SUCCESS) {
+ 		thread_deallocate(gpt_thread);
+ 	}
++	if (su.mmc) {
++		/* a30s: SweetHID's touch and key drivers and USB drive Qualcomm blocks. */
++		printf("SWEET MMC: touch, keys and USB skipped\n");
++		return 0;
++	}
+ 	/*
+ 	 * Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp).
+ 	 * Touch (FT5452 on QUP0 SE2) and keys (PM6125 over SPMI) are ported to
