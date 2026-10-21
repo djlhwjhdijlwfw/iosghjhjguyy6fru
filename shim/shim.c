@@ -82,11 +82,25 @@ static uint64_t cpu_mpidr(int i)
 	return i - 6;
 }
 
-/* What each core found about itself; written with the MMU (and so caches) off. */
+/* The inverse, as secondary_entry computes it in start.S. */
+static int cpu_index(uint64_t mpidr)
+{
+	int cluster = (mpidr >> 8) & 0xff, core = mpidr & 0xff;
+	return (cluster == 0 ? core + 6 : cluster == 2 ? core + 4 : core) & (NR_CPUS - 1);
+}
+
+/*
+ * What each core found about itself; written with the MMU (and so caches)
+ * off. A secondary that takes an exception records it here instead of
+ * drawing; one probing a register (probing) gets the instruction skipped.
+ */
 struct cpu_report {
-	uint64_t done, midr, mpidr, mmfr0, mmfr1, isar0, isar1, el, ticks;
+	uint64_t arrived, ctx, done, midr, mpidr, mmfr0, mmfr1, isar0, isar1, el;
+	uint64_t ticks, cycles, probing, faulted;
+	uint64_t crashed, esr, elr, far;
 };
 static volatile struct cpu_report rep[NR_CPUS];
+static uint64_t boot_mpidr;
 
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
@@ -237,9 +251,27 @@ static void irq_handler(void)
 
 void exc_handler(uint64_t slot, uint64_t *regs)
 {
+	uint64_t mpidr = rsr("mpidr_el1") & 0xffffff;
+	volatile struct cpu_report *me = &rep[cpu_index(mpidr)];
+
 	if (slot == 5) {	/* IRQ from current EL, SPx */
 		irq_handler();
 		return;
+	}
+	if ((slot & 3) == 0 && me->probing) {	/* a trapped probe: skip it */
+		me->faulted = 1;
+		wsr("elr_el1", rsr("elr_el1") + 4);
+		return;
+	}
+	if (mpidr != boot_mpidr) {	/* leave the screen to the boot core */
+		me->esr = rsr("esr_el1");
+		me->elr = rsr("elr_el1");
+		me->far = rsr("far_el1");
+		dsb();
+		me->crashed = 1;
+		dsb();
+		for (;;)
+			__asm__ volatile("wfi");
 	}
 	con_clear(BLUE);
 	switch (slot & 3) {
@@ -263,18 +295,34 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 
 /* ---- cores ---- */
 
-/* Timer ticks for a fixed count of one-cycle loop iterations, I-cache on. */
-static uint64_t speed_ticks(void)
+/*
+ * Time a fixed loop with the I-cache on: timer ticks always, and CPU cycles
+ * from the PMU cycle counter unless a hypervisor traps it (then the probing
+ * flag makes the exception handler skip each PMU instruction).
+ */
+static void speed(volatile struct cpu_report *c)
 {
-	uint64_t sctlr = rsr("sctlr_el1"), n = SPEED_LOOPS;
+	uint64_t sctlr = rsr("sctlr_el1"), n = SPEED_LOOPS, c0, c1;
+
+	c->probing = 1;
+	dsb();
+	wsr("pmccfiltr_el0", 0);			/* count at EL0 and EL1 */
+	wsr("pmcntenset_el0", 1UL << 31);		/* cycle counter on */
+	wsr("pmcr_el0", rsr("pmcr_el0") | 1);	/* E */
+	isb();
 	wsr("sctlr_el1", sctlr | (1UL << 12));	/* I-cache on (fine with MMU off) */
 	isb();
+	c0 = rsr("pmccntr_el0");
 	uint64_t t = now();
 	__asm__ volatile("1: subs %0, %0, #1\n\tb.ne 1b" : "+r"(n));
 	t = now() - t;
+	c1 = rsr("pmccntr_el0");
 	wsr("sctlr_el1", sctlr);
 	isb();
-	return t;
+	c->probing = 0;
+	dsb();
+	c->ticks = t;
+	c->cycles = c->faulted ? 0 : c1 - c0;
 }
 
 static void report_self(int idx, uint64_t el)
@@ -287,16 +335,22 @@ static void report_self(int idx, uint64_t el)
 	c->isar0 = rsr("id_aa64isar0_el1");
 	c->isar1 = rsr("id_aa64isar1_el1");
 	c->el = el;
-	c->ticks = speed_ticks();
+	speed(c);
 	dsb();
 	c->done = 1;
 	dsb();
 }
 
-void secondary_main(uint64_t idx, uint64_t el)
+/* idx comes from MPIDR (start.S); ctx is x0 as PSCI CPU_ON delivered it */
+void secondary_main(uint64_t idx, uint64_t el, uint64_t ctx)
 {
-	if (idx < NR_CPUS)
-		report_self(idx, el);
+	volatile struct cpu_report *c = &rep[idx & (NR_CPUS - 1)];
+
+	c->ctx = ctx;
+	dsb();
+	c->arrived = 1;
+	dsb();
+	report_self(idx & (NR_CPUS - 1), el);
 	smc(PSCI_CPU_OFF, 0, 0, 0);
 	for (;;)
 		__asm__ volatile("wfi");
@@ -307,8 +361,13 @@ static int field(uint64_t reg, int shift)
 	return (reg >> shift) & 0xf;
 }
 
-/* "C100  A53 midr=410FD034 16K:no  ~1586MHz"; the other features below */
-static void show_cpu(int i, int64_t ret, uint64_t f)
+/*
+ * "C000  A73 16K:YES x0=00000006 1768MHz": type, granule, the x0 CPU_ON
+ * delivered (the boot core says "boot") and the clock from the PMU cycle
+ * counter ("~": from the loop timing, the PMU being trapped). Crashed and
+ * missing cores get their own wording.
+ */
+static void show_cpu(int i, int64_t ret, uint64_t f, int self_idx)
 {
 	volatile struct cpu_report *c = &rep[i];
 	struct line l;
@@ -317,19 +376,36 @@ static void show_cpu(int i, int64_t ret, uint64_t f)
 	lstart(&l);
 	label[1] = '0' + ((cpu_mpidr(i) >> 8) & 0xf);
 	label[3] = '0' + (cpu_mpidr(i) & 0xf);
+	if (c->crashed) {
+		ls(&l, "CRASH esr=");
+		lx(&l, (uint32_t)c->esr, 8);
+		ls(&l, " pc=");
+		lx(&l, (uint32_t)c->elr, 8);
+		con_strc(label, l.b, YELLOW);
+		return;
+	}
 	if (!c->done) {
-		ls(&l, "no answer, CPU_ON=");
+		ls(&l, c->arrived ? "arrived, stuck. CPU_ON=" : "no answer, CPU_ON=");
 		lx(&l, (uint64_t)ret, 8);
 		con_strc(label, l.b, YELLOW);
 		return;
 	}
 	uint32_t part = (c->midr >> 4) & 0xfff;
-	ls(&l, part == 0xd09 ? "A73 " : part == 0xd03 ? "A53 " : "??? ");
-	ls(&l, "midr=");
-	lx(&l, (uint32_t)c->midr, 8);
+	ls(&l, part == 0xd09 ? "A73" : part == 0xd03 ? "A53" : "???");
 	ls(&l, field(c->mmfr0, 20) ? " 16K:YES " : " 16K:no  ");
-	ls(&l, "~");
-	ld(&l, c->ticks ? SPEED_LOOPS * f / c->ticks / 1000000 : 0);
+	if (i == self_idx)
+		ls(&l, "boot        ");
+	else {
+		ls(&l, "x0=");
+		lx(&l, (uint32_t)c->ctx, 8);
+		ls(&l, " ");
+	}
+	if (c->cycles && c->ticks)
+		ld(&l, c->cycles * f / c->ticks / 1000000);
+	else {
+		ls(&l, "~");
+		ld(&l, c->ticks ? SPEED_LOOPS * f / c->ticks / 1000000 : 0);
+	}
 	ls(&l, "MHz");
 	con_strc(label, l.b, field(c->mmfr0, 20) ? GREEN : WHITE);
 }
@@ -363,18 +439,24 @@ static void test_smp(int self_idx)
 		ret[i] = i == self_idx ? 0 :
 			 (int64_t)smc(PSCI_CPU_ON, cpu_mpidr(i), (uintptr_t)secondary_entry, i);
 	/* every core runs its speed loop before it reports: give the slow ones time */
-	for (int t = 0; t < 30; t++) {
+	for (int t = 0; t < 50; t++) {
 		int all = 1;
 		for (int i = 0; i < NR_CPUS; i++)
-			all &= rep[i].done != 0;
+			all &= rep[i].done || rep[i].crashed;
 		if (all)
 			break;
 		delay_ms(100);
 	}
 
-	int a73 = -1, a53 = -1;
+	int a73 = -1, a53 = -1, ctx_ok = 0, ctx_bad = 0;
 	for (int i = 0; i < NR_CPUS; i++) {
-		show_cpu(i, ret[i], f);
+		show_cpu(i, ret[i], f, self_idx);
+		if (i != self_idx && rep[i].arrived) {
+			if (rep[i].ctx == (uint64_t)i)
+				ctx_ok++;
+			else
+				ctx_bad++;
+		}
 		uint32_t part = (rep[i].midr >> 4) & 0xfff;
 		if (rep[i].done && part == 0xd09 && a73 < 0)
 			a73 = i;
@@ -386,6 +468,9 @@ static void test_smp(int self_idx)
 	if (a53 >= 0)
 		show_features("A53", a53);
 
+	if (ctx_ok + ctx_bad)
+		con_strc("PSCI", ctx_bad ? "x0 is NOT the context id: use MPIDR" :
+					   "x0 = context id, as asked", ctx_bad ? YELLOW : GREEN);
 	con_skip();
 	if (a73 < 0)
 		con_strc("VERDICT", "no A73 answered: see CPU_ON codes", YELLOW);
@@ -470,13 +555,15 @@ static void test_gic(void)
 
 void shim_main(uint64_t dtb, uint64_t el, uint64_t image)
 {
+	/* first: the exception handler tells the boot core from secondaries by it */
+	boot_mpidr = rsr("mpidr_el1") & 0xffffff;
 	/* S-BOOT leaves the DECON on a software trigger: let it scan out memory (uniLoader) */
 	wr32(DECON_F_BASE + HW_SW_TRIG_CONTROL, 0x1281);
 	dsb();
 
 	stage = "start";
 	con_clear(RED);
-	con_str("SHIM", "a30s milestone 1: diagnostics");
+	con_str("SHIM", "a30s milestone 1b: diagnostics");
 	con_hex2("ENTRY", "el=", el, "cntfrq=", rsr("cntfrq_el0"));
 	con_hex("IMAGE", image);
 	con_hex("X0 DTB", dtb);
@@ -500,8 +587,10 @@ void shim_main(uint64_t dtb, uint64_t el, uint64_t image)
 		if (cpu_mpidr(i) == self)
 			self_idx = i;
 	con_hex2("BOOTCPU", "mpidr=", self, "midr=", rsr("midr_el1"));
-	if (self_idx >= 0)
+	if (self_idx >= 0) {
+		rep[self_idx].arrived = 1;
 		report_self(self_idx, el);
+	}
 	test_smp(self_idx);
 	con_skip();
 

@@ -79,12 +79,28 @@ _start:
 3:	wfe
 	b	3b
 
-/* PSCI CPU_ON target. x0 = context id = cpu index (0..7). */
+/*
+ * PSCI CPU_ON target. x0 should be the context id, but Samsung's PSCI 0.1
+ * may not hand it over, so the core number comes from MPIDR. a30s: cluster
+ * 1 (0x100-0x103) = cpus 0-3, cluster 2 (0x200-0x201) = 4-5, cluster 0
+ * (0x0-0x1, the A73s) = 6-7. x0 as it arrived goes to secondary_main.
+ */
 	.globl secondary_entry
 secondary_entry:
 	msr	daifset, #0xf
-	mov	x19, x0
+	mov	x21, x0
 	el1_entry
+	mrs	x1, mpidr_el1
+	ubfx	x2, x1, #8, #8
+	and	x1, x1, #0xff
+	cmp	x2, #0
+	b.ne	5f
+	add	x1, x1, #6
+	b	6f
+5:	cmp	x2, #2
+	b.ne	6f
+	add	x1, x1, #4
+6:	and	x19, x1, #7
 	msr	spsel, #1
 	adr	x1, _sec_stacks
 	add	x1, x1, x19, lsl #12
@@ -95,6 +111,7 @@ secondary_entry:
 	isb
 	mov	x0, x19
 	mov	x1, x20
+	mov	x2, x21
 	bl	secondary_main
 4:	wfe
 	b	4b
