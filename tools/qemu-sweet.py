@@ -157,6 +157,7 @@ def main():
     ap.add_argument('--cpu', default='max')	# 16K granule; QEMU 6.2 has no cortex-a76
     ap.add_argument('--gic', default='2', choices=('2', '3'), help='virt GIC version (a30s: 2, topaz/sweet: 3)')
     ap.add_argument('--fb', default='0xec000000:720x1560', help='framebuffer BASE:WxH (topaz: 0x5c000000:1080x2400)')
+    ap.add_argument('--smp', default='2', help='virt CPUs; the others start powered off (PSCI). With one, a GICv2 reads ITARGETSR as 0')
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     a = ap.parse_args()
@@ -191,7 +192,7 @@ def main():
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = [os.environ.get('QEMU', 'qemu-system-aarch64'), '-M', f'virt,gic-version={a.gic}', '-cpu', a.cpu,
-           '-smp', '1', '-m', f'{ram_gib}G', '-nic', 'none',
+           '-smp', a.smp, '-m', f'{ram_gib}G', '-nic', 'none',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
