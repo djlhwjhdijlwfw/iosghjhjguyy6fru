@@ -111,7 +111,13 @@ struct cpu_report {
 	uint64_t ticks, cycles, probing, faulted;
 	uint64_t crashed, esr, elr, far;
 } __attribute__((aligned(64)));	/* one core's lines are its own */
-static volatile struct cpu_report rep[NR_CPUS];
+/*
+ * The reports live at a fixed address, in the unused tail of the 20 MiB
+ * fb_handover carve-out, so cores running from a copy of the shim (P3,
+ * P4 below) and the boot core see the same ones.
+ */
+#define MBOX_BASE	0xec800000UL
+#define rep		((volatile struct cpu_report *)MBOX_BASE)
 static uint64_t boot_mpidr;
 
 static volatile uint32_t irq_count, irq_other, irq_last;
@@ -386,20 +392,25 @@ static int field(uint64_t reg, int shift)
 }
 
 /*
- * "C000  A73 16K:YES x0=00000006 1768MHz": type, granule, the x0 CPU_ON
- * delivered (the boot core says "boot") and the clock from the PMU cycle
- * counter ("~": from the loop timing, the PMU being trapped). Crashed and
- * missing cores get their own wording.
+ * "C102  P2 A73 16K:YES x0=00000006 1768MHz": the phase the core was
+ * started in, type, granule, the x0 CPU_ON delivered (the boot core says
+ * "boot") and the clock from the PMU cycle counter ("~": from the loop
+ * timing, the PMU being trapped). Crashed and missing cores get their own
+ * wording.
  */
-static void show_cpu(int i, int64_t ret, uint64_t f, int self_idx)
+static void show_cpu(int i, int64_t ret, uint64_t f, int self_idx, int phase)
 {
 	volatile struct cpu_report *c = &rep[i];
 	struct line l;
 	char label[] = "C000";
+	char ph[] = "P0 ";
 
 	lstart(&l);
 	label[1] = '0' + ((cpu_mpidr(i) >> 8) & 0xf);
 	label[3] = '0' + (cpu_mpidr(i) & 0xf);
+	ph[1] = '0' + phase;
+	if (i != self_idx)
+		ls(&l, ph);
 	if (c->crashed) {
 		ls(&l, "CRASH esr=");
 		lx(&l, (uint32_t)c->esr, 8);
@@ -453,32 +464,95 @@ static void show_features(const char *label, int i)
 	con_str(label, l.b);
 }
 
+/* GIC-400 distributor (non-secure Group 1) and this core's CPU interface on. */
+static void gic_on(void)
+{
+	wr32(GICD_BASE + GICD_CTLR, rd32(GICD_BASE + GICD_CTLR) | 1);
+	wr32(GICC_BASE + GICC_PMR, 0xf0);
+	/* EnableGrp1, EOImodeNS = 0: the EOIR write also deactivates */
+	wr32(GICC_BASE + GICC_CTLR, (rd32(GICC_BASE + GICC_CTLR) & ~(1U << 9)) | 1);
+}
+
+/*
+ * Copy the whole shim to where uniLoader puts Linux and return the
+ * secondary entry point in the copy. The boot core stays where it is.
+ */
+#define RELOC_BASE	0x90000000UL
+extern char _head[], _end[];
+
+static uintptr_t relocated_entry(void)
+{
+	uintptr_t src = (uintptr_t)_head, n = (uintptr_t)_end - src;
+	volatile uint64_t *d = (volatile uint64_t *)RELOC_BASE;
+	volatile const uint64_t *sp = (volatile const uint64_t *)src;
+
+	for (uintptr_t i = 0; i < n / 8; i++)
+		d[i] = sp[i];
+	civac((void *)RELOC_BASE, n);
+	__asm__ volatile("ic iallu\n\tdsb sy\n\tisb" ::: "memory");
+	return RELOC_BASE + ((uintptr_t)secondary_entry - src);
+}
+
+/* CPU_ON one core and give it a second to report or crash. */
+static int64_t start_one(int i, uintptr_t entry, uint64_t ctx)
+{
+	int64_t r = (int64_t)smc(PSCI_CPU_ON, cpu_mpidr(i), entry, ctx);
+
+	for (int t = 0; t < 100; t++) {
+		civac(&rep[i], sizeof(rep[i]));
+		if (rep[i].done || rep[i].crashed)
+			break;
+		delay_ms(10);
+	}
+	return r;
+}
+
+/*
+ * Linux on this phone starts every core with the same PSCI 0.1 CPU_ON,
+ * yet with the first shims no core ever arrived. What Linux does
+ * differently: one core at a time, x0 = 0, the GIC on, and an entry point
+ * in a kernel at 0x90000000 (where uniLoader puts it) instead of in
+ * S-BOOT's buffer. Each phase adds one of them, on its own core:
+ *   P1 C101  one at a time, x0 = 0
+ *   P2 C102  + GIC distributor and CPU interface on
+ *   P3 C103  + entry in a copy of the shim at 0x90000000
+ *   P4 rest  all of it, x0 = core index (does PSCI deliver it?)
+ */
+static int smp_phase(int i)
+{
+	return i >= 1 && i <= 3 ? i : 4;
+}
+
 static void test_smp(int self_idx)
 {
 	uint64_t f = rsr("cntfrq_el0");
 	int64_t ret[NR_CPUS];
+	uintptr_t entry = (uintptr_t)secondary_entry;
+	int gic = 0, worked[5] = { 0, 0, 0, 0, 0 }, tried[5] = { 0, 0, 0, 0, 0 };
 
 	stage = "smp";
-	for (int i = 0; i < NR_CPUS; i++)
-		ret[i] = i == self_idx ? 0 :
-			 (int64_t)smc(PSCI_CPU_ON, cpu_mpidr(i), (uintptr_t)secondary_entry, i);
-	/* every core runs its speed loop before it reports: give the slow ones time */
-	for (int t = 0; t < 50; t++) {
-		int all = 1;
+	for (int p = 1; p <= 4; p++)
 		for (int i = 0; i < NR_CPUS; i++) {
-			if (i != self_idx)
-				civac(&rep[i], sizeof(rep[i]));
-			all &= rep[i].done || rep[i].crashed;
+			if (i == self_idx || smp_phase(i) != p)
+				continue;
+			if (p >= 2 && !gic) {
+				gic_on();
+				gic = 1;
+			}
+			if (p >= 3 && entry == (uintptr_t)secondary_entry) {
+				stage = "relocate";
+				entry = relocated_entry();
+				stage = "smp";
+			}
+			ret[i] = start_one(i, entry, p == 4 ? (uint64_t)i : 0);
+			tried[p]++;
+			worked[p] += rep[i].arrived != 0;
 		}
-		if (all)
-			break;
-		delay_ms(100);
-	}
 
 	int a73 = -1, a53 = -1, ctx_ok = 0, ctx_bad = 0;
 	for (int i = 0; i < NR_CPUS; i++) {
-		show_cpu(i, ret[i], f, self_idx);
-		if (i != self_idx && rep[i].arrived) {
+		show_cpu(i, i == self_idx ? 0 : ret[i], f, self_idx, smp_phase(i));
+		if (i != self_idx && smp_phase(i) == 4 && rep[i].arrived) {
 			if (rep[i].ctx == (uint64_t)i)
 				ctx_ok++;
 			else
@@ -495,6 +569,18 @@ static void test_smp(int self_idx)
 	if (a53 >= 0)
 		show_features("A53", a53);
 
+	struct line l;
+	lstart(&l);
+	for (int p = 1; p <= 4; p++) {
+		char ph[] = "P0:";
+		ph[1] = '0' + p;
+		ls(&l, ph);
+		ld(&l, worked[p]);
+		ls(&l, "/");
+		ld(&l, tried[p]);
+		ls(&l, " ");
+	}
+	con_strc("ARRIVED", l.b, worked[1] + worked[2] + worked[3] + worked[4] ? GREEN : YELLOW);
 	if (ctx_ok + ctx_bad)
 		con_strc("PSCI", ctx_bad ? "x0 is NOT the context id: use MPIDR" :
 					   "x0 = context id, as asked", ctx_bad ? YELLOW : GREEN);
@@ -592,7 +678,7 @@ void shim_main(uint64_t dtb, uint64_t el, uint64_t image)
 
 	stage = "start";
 	con_clear(RED);
-	con_str("SHIM", "a30s milestone 1c: diagnostics");
+	con_str("SHIM", "a30s milestone 1d: diagnostics");
 	con_hex2("ENTRY", "el=", el, "cntfrq=", rsr("cntfrq_el0"));
 	con_hex("IMAGE", image);
 	con_hex("X0 DTB", dtb);
@@ -616,6 +702,10 @@ void shim_main(uint64_t dtb, uint64_t el, uint64_t image)
 		if (cpu_mpidr(i) == self)
 			self_idx = i;
 	con_hex2("BOOTCPU", "mpidr=", self, "midr=", rsr("midr_el1"));
+	volatile uint64_t *mbox = (volatile uint64_t *)MBOX_BASE;
+	for (unsigned i = 0; i < NR_CPUS * sizeof(struct cpu_report) / 8; i++)
+		mbox[i] = 0;
+	civac((void *)MBOX_BASE, NR_CPUS * sizeof(struct cpu_report));
 	if (self_idx >= 0) {
 		rep[self_idx].arrived = 1;
 		report_self(self_idx, el);
