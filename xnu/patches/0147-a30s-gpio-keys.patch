@@ -1,0 +1,126 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 65970f9..603881e 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -12,6 +12,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -180,4 +181,86 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
++
++/*
++ * a30s: the keys are GPIOs of the Exynos 7904's alive pin controller,
++ * active low: GPA1 5 volume up, 6 volume down, 7 power (ztOS's a30s dts;
++ * the shim's key watch reads the same bits). ADT /sweet-gpio-keys reg is
++ * the bank's CON register, DAT follows at +4. Only DAT is read: the pins
++ * stay as S-BOOT left them (external interrupt function, which still
++ * reads the level).
++ */
++#define GPIO_KEYS_CON    0x0u
++#define GPIO_KEYS_DAT    0x4u
++
++static const struct {
++	uint8_t bit;
++	int key;                /* sweet_hid_key: 0 power, 1 volume up, 2 volume down */
++} gpio_keys_map[] = {
++	{ 7, 0 }, { 5, 1 }, { 6, 2 },
++};
++static vm_offset_t gpio_keys_bank;
++
++static void
++gpio_keys_thread(void *arg, wait_result_t result)
++{
++	int state[3] = { 0, 0, 0 };
++	(void)arg;
++	(void)result;
++	for (;;) {
++		uint32_t dat = keys_rd(gpio_keys_bank, GPIO_KEYS_DAT);
++		for (unsigned i = 0; i < 3; i++) {
++			int down = !(dat & (1u << gpio_keys_map[i].bit));
++			if (down != state[i]) {
++				state[i] = down;
++				printf("SWEET KEYS: key=%d down=%d gpio dat=%#x\n",
++				    gpio_keys_map[i].key, down, dat & 0xffu);
++				sweet_hid_key(gpio_keys_map[i].key, down);
++			}
++		}
++		keys_wait();
++	}
++}
++
++void sweet_gpio_keys_init(void);
++
++void
++sweet_gpio_keys_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	int enabled = 1;
++	thread_t thread;
++
++	if (keys_started) {
++		return;
++	}
++	keys_started = true;
++	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/sweet-gpio-keys", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET KEYS: no /sweet-gpio-keys node in the device tree\n");
++		return;
++	}
++	vm_offset_t page = ml_io_map(reg[0] & ~(uintptr_t)PAGE_MASK, PAGE_SIZE);
++	if (page == 0) {
++		printf("SWEET KEYS: MMIO mapping failed\n");
++		return;
++	}
++	gpio_keys_bank = page + (reg[0] & PAGE_MASK);
++	printf("SWEET KEYS: GPIO keys at %#lx: con %#x dat %#x\n", (unsigned long)reg[0],
++	    keys_rd(gpio_keys_bank, GPIO_KEYS_CON), keys_rd(gpio_keys_bank, GPIO_KEYS_DAT));
++	kern_return_t kr = kernel_thread_start(gpio_keys_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET KEYS: kernel_thread_start failed %d\n", kr);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index bf6084f..f72e071 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
++extern void sweet_gpio_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+@@ -1395,8 +1396,12 @@ sweet_ufs_init(void)
+ 		thread_deallocate(gpt_thread);
+ 	}
+ 	if (su.mmc) {
+-		/* a30s: SweetHID's touch and key drivers and USB drive Qualcomm blocks. */
+-		printf("SWEET MMC: touch, keys and USB skipped\n");
++		/*
++		 * a30s: the keys are GPIOs (ADT /sweet-gpio-keys); SweetHID's touch
++		 * driver and USB drive Qualcomm blocks.
++		 */
++		sweet_gpio_keys_init();
++		printf("SWEET MMC: touch and USB skipped\n");
+ 		return 0;
+ 	}
+ 	/*

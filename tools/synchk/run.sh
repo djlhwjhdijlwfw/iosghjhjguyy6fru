@@ -11,7 +11,8 @@
 #   for d in *.deb; do dpkg -x $d ~/clang14/root; done
 # xnu builds this file without -Werror, so warnings are reported, not fatal.
 # Known on the unchanged file: -Wcast-align in sweet_ufs_ioctl and
-# -Wmissing-noreturn on sweet_gpt_watch; -Wdeclaration-after-statement is hidden.
+# -Wmissing-noreturn on sweet_gpt_watch (and sweet_keys.c's polling threads);
+# -Wdeclaration-after-statement is hidden.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 FILE=${1:-$HOME/xnu-a30s/bsd/dev/sweet_ufs.c}

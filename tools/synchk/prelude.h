@@ -12,6 +12,7 @@
 #define NSEC_PER_MSEC 1000000ull
 #define NSEC_PER_USEC 1000ull
 #define PAGE_MASK 0x3fffu
+#define PAGE_SIZE 0x4000u
 #define DEV_BSIZE 512
 #define PZERO 22
 #define FWRITE 2
@@ -167,3 +168,4 @@ int memcmp(const void *, const void *, size_t);
 int strcmp(const char *, const char *);
 size_t strlen(const char *);
 char *strchr(const char *, int);
+void thread_deallocate(thread_t);

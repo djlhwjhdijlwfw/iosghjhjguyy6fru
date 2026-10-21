@@ -34,6 +34,8 @@ SWEET_ECID = 0x4133305300000001  # 'A30S' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 720, 1560, 720 * 4
 # dwmmc0 (mmc@13500000): the eMMC S-BOOT boots from, with the SMU (FMP) block
 MMC, MMC_SIZE = 0x13500000, 0x2000
+# pinctrl alive bank GPA1 (CON, DAT at +4): keys, active low (bsd/dev/sweet_keys.c)
+GPIO_KEYS, GPIO_KEYS_SIZE = 0x11cb0060, 0x20
 # arm,armv8-timer: CNTFRQ is 26 MHz (OSCCLK); the virtual timer is PPI 11
 TIMEBASE = 26000000
 VTIMER_INTID = 27
@@ -209,6 +211,13 @@ def build(seed=None, qemu=False):
         ('reg', u64(MMC, MMC_SIZE)),
     ])
 
+    # bsd/dev/sweet_keys.c, GPIO keys: GPA1 5 volume up, 6 volume down, 7 power
+    gpio_keys = node('sweet-gpio-keys', [
+        ph(),
+        ('compatible', cstr('samsung,exynos7885-gpa1-keys')),
+        ('reg', u64(GPIO_KEYS, GPIO_KEYS_SIZE)),
+    ])
+
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
@@ -245,7 +254,7 @@ def build(seed=None, qemu=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [mmc]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [mmc, gpio_keys]))
 
 
 if __name__ == '__main__':
