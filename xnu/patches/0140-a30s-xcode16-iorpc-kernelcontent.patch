@@ -1,8 +1,8 @@
 diff --git a/iokit/DriverKit/IORPC.h b/iokit/DriverKit/IORPC.h
-index 3ded78c..cfb1583 100644
+index 3ded78c..c38e6d2 100644
 --- a/iokit/DriverKit/IORPC.h
 +++ b/iokit/DriverKit/IORPC.h
-@@ -224,6 +224,15 @@ struct IORPC {
+@@ -224,6 +224,17 @@ struct IORPC {
  	IORPCMessageMach * reply;
  	uint32_t           sendSize;
  	uint32_t           replySize;
@@ -11,7 +11,31 @@ index 3ded78c..cfb1583 100644
 +	 * a30s: Xcode 16's iig (the oldest Xcode Codemagic offers) emits kernel
 +	 * dispatch code that takes the parsed message from here instead of
 +	 * calling IORPCMessageFromMach(), as xnu-11215 and later provide.
-+	 * Filled wherever the kernel builds an IORPC (IOUserServer.cpp).
++	 * Filled wherever the kernel builds an IORPC (IOUserServer.cpp). The
++	 * kernel includes IOKit/IORPC.h, iig output DriverKit/IORPC.h: the two
++	 * copies must stay the same.
++	 */
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
+diff --git a/iokit/IOKit/IORPC.h b/iokit/IOKit/IORPC.h
+index 3ded78c..c38e6d2 100644
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -224,6 +224,17 @@ struct IORPC {
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	/*
++	 * a30s: Xcode 16's iig (the oldest Xcode Codemagic offers) emits kernel
++	 * dispatch code that takes the parsed message from here instead of
++	 * calling IORPCMessageFromMach(), as xnu-11215 and later provide.
++	 * Filled wherever the kernel builds an IORPC (IOUserServer.cpp). The
++	 * kernel includes IOKit/IORPC.h, iig output DriverKit/IORPC.h: the two
++	 * copies must stay the same.
 +	 */
 +	IORPCMessage     * kernelContent;
 +#endif /* KERNEL */
