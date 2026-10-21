@@ -21,6 +21,12 @@ workflows:
         CCACHE_COMPILERCHECK: content
         CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,file_macro,pch_defines
         CCACHE_MAXSIZE: 3G
+        # The Xcode 16.0 image runs a macOS Homebrew no longer has bottles for:
+        # every install or upgrade builds from source (cmake alone takes ages)
+        HOMEBREW_NO_AUTO_UPDATE: "1"
+        HOMEBREW_NO_INSTALL_UPGRADE: "1"
+        HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+        HOMEBREW_NO_INSTALL_CLEANUP: "1"
     cache:
       cache_paths:
         - ~/.ccache
@@ -47,10 +53,21 @@ workflows:
       - name: Deps
         script: |
           set -euo pipefail
-          brew install jq gum bash cmake ninja ccache
-          # build.sh only checks that xcodes exists (Xcode is preinstalled)
-          printf '#!/bin/sh\nexit 0\n' > "$(brew --prefix)/bin/xcodes"
-          chmod +x "$(brew --prefix)/bin/xcodes"
+          BIN=$(brew --prefix)/bin
+          # build.sh really runs only jq; bash is the shell it wants. Install
+          # those if missing (small even from source), nothing else.
+          command -v jq > /dev/null || brew install jq
+          [ -x "$BIN/bash" ] || brew install bash
+          # install_deps only checks that these exist (and brew-installs all of
+          # them if one is missing): gum is for the interactive version menu,
+          # xcodes for installing Xcode, cmake and ninja are not used
+          for f in gum xcodes cmake ninja; do
+            if ! command -v "$f" > /dev/null; then
+              printf '#!/bin/sh\nexit 0\n' > "$BIN/$f"
+              chmod +x "$BIN/$f"
+              echo "stub $f"
+            fi
+          done
           sw_vers
           xcode-select -p
           xcodebuild -version
@@ -59,9 +76,12 @@ workflows:
           echo "CCACHE_DIR=$HOME/.ccache" >> "$CM_ENV"
           echo "CCACHE_BASEDIR=$CM_BUILD_DIR" >> "$CM_ENV"
           echo "CCACHE_WRAP=$CM_BUILD_DIR/ccache-bin" >> "$CM_ENV"
+          # ccache only if the image already has it: building it from source
+          # costs more than it saves
+          CCACHE=$(command -v ccache || true)
           mkdir -p "$CM_BUILD_DIR/ccache-bin"
           for t in clang clang++; do
-            printf '#!/bin/sh\nexec %s %s "$@"\n' "$(brew --prefix)/bin/ccache" "$(xcrun -find $t)" > "$CM_BUILD_DIR/ccache-bin/$t"
+            printf '#!/bin/sh\nexec %s %s "$@"\n' "$CCACHE" "$(xcrun -find $t)" > "$CM_BUILD_DIR/ccache-bin/$t"
             chmod +x "$CM_BUILD_DIR/ccache-bin/$t"
           done
           cat "$CM_BUILD_DIR/ccache-bin/clang"
