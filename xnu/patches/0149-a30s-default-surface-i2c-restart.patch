@@ -1,0 +1,205 @@
+diff --git a/bsd/dev/sweet_ist.c b/bsd/dev/sweet_ist.c
+index 7151f09..ca53e62 100755
+--- a/bsd/dev/sweet_ist.c
++++ b/bsd/dev/sweet_ist.c
+@@ -152,9 +152,12 @@ ist_wait_pend(void)
+ 
+ /*
+  * START, or a repeated START while the bus is held, with the address byte.
+- * As Linux's i2c-s3c2410: mode, address, IICCON written back unchanged (a
+- * pending flag cleared here would first send IICDS on the old phase), then
+- * START, which clears the flag.
++ * As Linux's i2c-s3c2410 (message_start, then the pending flag cleared on
++ * the way out of its interrupt handler): mode, address, IICCON written back
++ * unchanged (a pending flag cleared before START would first send IICDS on
++ * the old phase), START, and only then the flag cleared. START itself does
++ * not clear it: without that a repeated START was taken as done at once and
++ * every read began with the address byte (phone boot 5: chip 0xa1000040).
+  */
+ static int
+ ist_start(uint8_t addr, uint32_t mode)
+@@ -165,7 +168,7 @@ ist_start(uint8_t addr, uint32_t mode)
+ 	delay(1);
+ 	wr32(ist_i2c + IICCON, con);
+ 	wr32(ist_i2c + IICSTAT, mode | IICSTAT_TXRXEN | IICSTAT_BUSY);
+-	delay(2);
++	wr32(ist_i2c + IICCON, con & ~IICCON_IRQPEND);
+ 	int error = ist_wait_pend();
+ 	if (!error && (rd32(ist_i2c + IICSTAT) & IICSTAT_NACK)) {
+ 		error = ENXIO;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f70964e..b7b19e9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -146,7 +146,8 @@ public:
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+-	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
++	SweetSurface *fSurface;         /* the panel memory as an IOSurface (the default surface) */
++	SweetSurface *fPanel;           /* a30s scaled mode: the panel memory; fSurface is then RAM */
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+@@ -329,10 +330,28 @@ AppleCLCD::start(IOService *provider)
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	if (fScale && fSurface != NULL) {
++		/*
++		 * a30s: iOS must see one size end to end. With the 720x1560 panel as
++		 * its default surface and 1125x2436 as the display size CoreAnimation
++		 * asks for Apple's hardware scaler (AppleM2ScalerCSCDriver) and draws
++		 * nothing (phone boots 2-5); so it gets a 1125x2436 surface in RAM
++		 * (rows aligned like its own, 4608 bytes), and the kernel scales.
++		 */
++		fPanel = fSurface;
++		fSurface = sweet_surface_create_kernel(fLogicalW, fLogicalH, (fLogicalW * 4 + 255) & ~255u,
++		    SWEET_FB_FORMAT_BGRA);
++		if (fSurface == NULL) {
++			IOLog("SWEET FB: no RAM default surface, using the panel\n");
++			fSurface = fPanel;
++			fPanel = NULL;
++		}
++	}
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
++		OSSafeReleaseNULL(fPanel);
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
+@@ -452,9 +471,9 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+-	    fScale ? ", scaled" : "");
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u %ux%u, presented as %ux%u%s\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fSurface->width, fSurface->height,
++	    fLogicalW, fLogicalH, fScale ? ", scaled" : "");
+ 	return true;
+ }
+ 
+@@ -591,6 +610,36 @@ get32(const uint8_t *p, uint32_t off)
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
++
++/*
++ * a30s bring-up: how much of a frame about to be shown is not black (an
++ * 8x8 grid of samples, RGB only), logged for the first 16 frames and then
++ * every 256th: tells "iOS draws nothing" from "the frame does not reach
++ * the panel".
++ */
++static void
++sweet_fb_check_frame(const uint8_t *buf, uint32_t stride, uint32_t w, uint32_t h)
++{
++	static uint32_t frames;
++	uint32_t n = frames++;
++	if (n >= 16 && (n % 256) != 0) {
++		return;
++	}
++	uint32_t lit = 0, first = 0;
++	for (uint32_t gy = 0; gy < 8; gy++) {
++		const uint32_t *row = (const uint32_t *)(buf + (uint64_t)((2 * gy + 1) * h / 16) * stride);
++		for (uint32_t gx = 0; gx < 8; gx++) {
++			uint32_t p = row[(2 * gx + 1) * w / 16];
++			if (p & 0x00ffffffu) {
++				if (lit++ == 0) {
++					first = p;
++				}
++			}
++		}
++	}
++	IOLog("SWEET FB: frame %u: %u/64 samples not black (first %#x)\n", n, lit, first);
++}
++
+ static uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -1078,6 +1127,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	sweet_fb_check_frame(dst, fRowBytes, fWidth, fHeight);
+ 	if (fFlip[0] != NULL) {
+ 		flipBack();
+ 	}
+@@ -1113,7 +1163,7 @@ AppleCLCD::presentScaled(const uint8_t *rec)
+ 			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, dx, dy, w, h);
+ 		}
+-		if (s == NULL || s == fSurface) {
++		if (s == NULL || s == fPanel || (fPanel == NULL && s == fSurface)) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+@@ -1173,6 +1223,7 @@ AppleCLCD::presentScaled(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	sweet_fb_check_frame(dst, fRowBytes, fWidth, fHeight);
+ 	memcpy((void *)fPixels, dst, (size_t)fRowBytes * fHeight);
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 19ef8ab..fcf2c5f 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -338,6 +338,35 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+ 	return s;
+ }
+ 
++SweetSurface *
++sweet_surface_create_kernel(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat)
++{
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
++	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	if (mem != NULL) {
++		bzero(mem->getBytesNoCopy(), s->allocSize);
++	}
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	if (s->memory == NULL || !sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index a2f7201..3a14a8f 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -64,6 +64,13 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/*
++ * a30s: a zeroed kernel RAM surface (shared with the tasks that map it),
++ * published like sweet_surface_create_physical's. Returns it retained.
++ */
++SweetSurface *sweet_surface_create_kernel(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat);
++
+ /*
+  * topaz scanout pool: physically contiguous low memory (below 4 GiB, unused by
+  * xnu, which runs in the upper DDR bank) so the MDP can fetch a surface
