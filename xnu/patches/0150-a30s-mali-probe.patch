@@ -1,0 +1,310 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f41a737..acfce75 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_ist.c			standard
++bsd/dev/sweet_mali.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+new file mode 100755
+index 0000000..d8a73fd
+--- /dev/null
++++ b/bsd/dev/sweet_mali.c
+@@ -0,0 +1,272 @@
++/*
++ * a30s: first step of a GPU driver for the Exynos 7904's ARM Mali-G71 MP2
++ * (Bifrost, at 0x11500000; ADT /sweet-mali). Boot-arg sweetgpu=1 runs it,
++ * once, on its own thread; without it nothing here touches the GPU.
++ *
++ * It only proves the GPU can be brought up under xnu and reports what it
++ * is: the G3D power domain on (PMU), the GPU clocked from CMU_TOP's G3D
++ * switching clock (about 400 MHz, as ztOS's clock driver does while PLL_G3D
++ * relocks) without touching PLL_G3D or the supply, the GPU's registers read
++ * (GPU_ID, features, present cores), a soft reset, then the L2 and the
++ * shader cores powered on and off again. Its interrupts stay masked in the
++ * GPU and off at the GIC. iOS cannot use it: that needs a Metal
++ * implementation for Mali (see A30S.md, "GPU").
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_mali_probe(void);
++
++/* Exynos 7904 (exynos7885 in Linux) */
++#define MALI_PMU_G3D            0x11c840a0u     /* pd_g3d: CONFIGURATION, STATUS at +4 */
++#define MALI_PD_ON              0xfu
++#define MALI_CMU_TOP            0x12060000u
++#define MALI_TOP_SWITCH_DIV     0x1858u         /* CLK_CON_DIV_CLKCMU_G3D_SWITCH, from 800 MHz */
++#define MALI_TOP_SWITCH_GATE    0x2058u         /* CLK_CON_GAT_GATE_CLKCMU_G3D_SWITCH */
++#define MALI_GATE_ON            (1u << 21)
++#define MALI_CMU_G3D            0x11400000u
++#define MALI_G3D_PLL_CON0       0x0120u         /* PLL_G3D: bit 4 selects it over oscclk */
++#define MALI_G3D_SWITCH_USER    0x0100u         /* bit 4: dout_g3d_switch instead of oscclk */
++#define MALI_G3D_BUSD           0x1004u         /* bit 0: switch clock instead of PLL_G3D */
++#define MALI_MUX_SEL            (1u << 4)
++#define MALI_BUSD_SWITCH        (1u << 0)
++#define MALI_MUX_BUSY           (1u << 16)
++#define MALI_GICD               0x12301000u
++#define MALI_GICD_ICENABLER     0x180u
++
++/* Mali (Midgard/Bifrost register map) */
++#define GPU_ID                  0x000u
++#define GPU_L2_FEATURES         0x004u
++#define GPU_CORE_FEATURES       0x008u
++#define GPU_TILER_FEATURES      0x00cu
++#define GPU_MEM_FEATURES        0x010u
++#define GPU_MMU_FEATURES        0x014u
++#define GPU_AS_PRESENT          0x018u
++#define GPU_JS_PRESENT          0x01cu
++#define GPU_IRQ_RAWSTAT         0x020u
++#define GPU_IRQ_CLEAR           0x024u
++#define GPU_IRQ_MASK            0x028u
++#define GPU_COMMAND             0x030u
++#define GPU_STATUS              0x034u
++#define GPU_THREAD_MAX          0x0a0u
++#define GPU_SHADER_PRESENT      0x100u
++#define GPU_TILER_PRESENT       0x110u
++#define GPU_L2_PRESENT          0x120u
++#define GPU_SHADER_READY        0x140u
++#define GPU_TILER_READY         0x150u
++#define GPU_L2_READY            0x160u
++#define GPU_SHADER_PWRON        0x180u
++#define GPU_TILER_PWRON         0x190u
++#define GPU_L2_PWRON            0x1a0u
++#define GPU_SHADER_PWROFF       0x1c0u
++#define GPU_TILER_PWROFF        0x1d0u
++#define GPU_L2_PWROFF           0x1e0u
++#define JOB_IRQ_MASK            0x1008u
++#define MMU_IRQ_MASK            0x2008u
++#define GPU_CMD_SOFT_RESET      0x01u
++#define GPU_IRQ_RESET_DONE      (1u << 8)
++#define MALI_SPI_FIRST          158u            /* gpu 158, job 159, mmu 160 */
++
++static vm_offset_t mali;
++static bool mali_started;
++static int mali_chan;
++
++static inline uint32_t
++rd32(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++wr32(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++static void
++mali_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&mali_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* (rd32(reg) & mask) == want within ms milliseconds */
++static bool
++mali_wait(vm_offset_t reg, uint32_t mask, uint32_t want, uint32_t ms)
++{
++	for (uint32_t i = 0; i <= ms * 10; i++) {
++		if ((rd32(reg) & mask) == want) {
++			return true;
++		}
++		delay(100);
++	}
++	return false;
++}
++
++static const char *
++mali_name(uint32_t id)
++{
++	switch (id >> 16) {
++	case 0x6000: return "Mali-G71";
++	case 0x6221: return "Mali-G72";
++	case 0x7212: return "Mali-G52";
++	case 0x7093: return "Mali-G31";
++	default: return "Mali (unknown)";
++	}
++}
++
++/* Power domain and clock. Returns 0 or an errno; reads first, writes only what is off. */
++static int
++mali_power_clock(void)
++{
++	vm_offset_t pmu = ml_io_map(MALI_PMU_G3D & ~(uint32_t)PAGE_MASK, PAGE_SIZE) + (MALI_PMU_G3D & PAGE_MASK);
++	vm_offset_t top = ml_io_map(MALI_CMU_TOP, MALI_TOP_SWITCH_GATE + 4);
++	if (pmu == 0 || top == 0) {
++		return ENOMEM;
++	}
++	uint32_t pd_cfg = rd32(pmu), pd_st = rd32(pmu + 4);
++	uint32_t div = rd32(top + MALI_TOP_SWITCH_DIV), gate = rd32(top + MALI_TOP_SWITCH_GATE);
++	printf("SWEET MALI: G3D domain config %#x status %#x, switch clock div %#x gate %#x\n",
++	    pd_cfg, pd_st, div, gate);
++	/* 800 MHz / (ratio + 1): refuse more than about 400 MHz at the bootloader's voltage */
++	if ((div & 7u) == 0) {
++		printf("SWEET MALI: switch clock would be 800 MHz, stopping\n");
++		return EINVAL;
++	}
++	if ((pd_st & MALI_PD_ON) != MALI_PD_ON) {
++		wr32(pmu, MALI_PD_ON);
++		if (!mali_wait(pmu + 4, MALI_PD_ON, MALI_PD_ON, 1)) {
++			printf("SWEET MALI: G3D domain does not come on (status %#x)\n", rd32(pmu + 4));
++			return ETIMEDOUT;
++		}
++	}
++	if (!(gate & MALI_GATE_ON)) {
++		wr32(top + MALI_TOP_SWITCH_GATE, gate | MALI_GATE_ON);
++	}
++
++	/* CMU_G3D sits in the G3D domain: readable only now. */
++	vm_offset_t g3d = ml_io_map(MALI_CMU_G3D, MALI_G3D_BUSD + 4);
++	if (g3d == 0) {
++		return ENOMEM;
++	}
++	uint32_t pll = rd32(g3d + MALI_G3D_PLL_CON0), user = rd32(g3d + MALI_G3D_SWITCH_USER);
++	uint32_t busd = rd32(g3d + MALI_G3D_BUSD);
++	printf("SWEET MALI: CMU_G3D pll_con0 %#x switch_user %#x busd %#x\n", pll, user, busd);
++	if (!(user & MALI_MUX_SEL)) {
++		wr32(g3d + MALI_G3D_SWITCH_USER, user | MALI_MUX_SEL);
++	}
++	if (!(busd & MALI_BUSD_SWITCH)) {
++		wr32(g3d + MALI_G3D_BUSD, busd | MALI_BUSD_SWITCH);
++		if (!mali_wait(g3d + MALI_G3D_BUSD, MALI_MUX_BUSY, 0, 1)) {
++			printf("SWEET MALI: G3D BUSD mux stays busy\n");
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++static void
++mali_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	if (mali_power_clock() != 0) {
++		return;
++	}
++	/* The GPU's interrupts: masked in the GPU, off at the GIC. */
++	vm_offset_t gicd = ml_io_map(MALI_GICD & ~(uint32_t)PAGE_MASK, PAGE_SIZE) + (MALI_GICD & PAGE_MASK);
++	if (gicd != 0) {
++		for (uint32_t spi = MALI_SPI_FIRST; spi < MALI_SPI_FIRST + 3; spi++) {
++			uint32_t id = 32u + spi;
++			wr32(gicd + MALI_GICD_ICENABLER + 4 * (id / 32), 1u << (id % 32));
++		}
++	}
++	uint32_t id = rd32(mali + GPU_ID);
++	if (id == 0 || id == 0xffffffffu) {
++		printf("SWEET MALI: GPU_ID reads %#x: no GPU answering\n", id);
++		return;
++	}
++	wr32(mali + GPU_IRQ_MASK, 0);
++	wr32(mali + JOB_IRQ_MASK, 0);
++	wr32(mali + MMU_IRQ_MASK, 0);
++	uint32_t shaders = rd32(mali + GPU_SHADER_PRESENT), l2 = rd32(mali + GPU_L2_PRESENT);
++	uint32_t tiler = rd32(mali + GPU_TILER_PRESENT);
++	printf("SWEET MALI: %s r%up%u (GPU_ID %#x), shader cores %#x (%u), tiler %#x, L2 %#x\n",
++	    mali_name(id), (id >> 12) & 0xfu, (id >> 4) & 0xfu, id, shaders,
++	    (uint32_t)__builtin_popcount(shaders), tiler, l2);
++	printf("SWEET MALI: L2 %#x core %#x tiler %#x mem %#x mmu %#x features, AS %#x JS %#x, threads %u, status %#x\n",
++	    rd32(mali + GPU_L2_FEATURES), rd32(mali + GPU_CORE_FEATURES), rd32(mali + GPU_TILER_FEATURES),
++	    rd32(mali + GPU_MEM_FEATURES), rd32(mali + GPU_MMU_FEATURES), rd32(mali + GPU_AS_PRESENT),
++	    rd32(mali + GPU_JS_PRESENT), rd32(mali + GPU_THREAD_MAX), rd32(mali + GPU_STATUS));
++
++	wr32(mali + GPU_IRQ_CLEAR, 0xffffffffu);
++	wr32(mali + GPU_COMMAND, GPU_CMD_SOFT_RESET);
++	if (!mali_wait(mali + GPU_IRQ_RAWSTAT, GPU_IRQ_RESET_DONE, GPU_IRQ_RESET_DONE, 100)) {
++		printf("SWEET MALI: soft reset did not complete (rawstat %#x)\n", rd32(mali + GPU_IRQ_RAWSTAT));
++		return;
++	}
++	wr32(mali + GPU_IRQ_CLEAR, 0xffffffffu);
++	wr32(mali + GPU_L2_PWRON, l2);
++	bool l2_up = mali_wait(mali + GPU_L2_READY, l2, l2, 50);
++	wr32(mali + GPU_TILER_PWRON, tiler);
++	wr32(mali + GPU_SHADER_PWRON, shaders);
++	bool cores_up = l2_up && mali_wait(mali + GPU_SHADER_READY, shaders, shaders, 50) &&
++	    mali_wait(mali + GPU_TILER_READY, tiler, tiler, 50);
++	printf("SWEET MALI: soft reset done; L2 %s, shader cores %s (ready %#x), tiler ready %#x\n",
++	    l2_up ? "up" : "NOT up", cores_up ? "up" : "NOT up", rd32(mali + GPU_SHADER_READY),
++	    rd32(mali + GPU_TILER_READY));
++	/* Nothing runs on it yet: power the cores down again, the domain stays on. */
++	wr32(mali + GPU_SHADER_PWROFF, shaders);
++	wr32(mali + GPU_TILER_PWROFF, tiler);
++	mali_sleep_ms(1);
++	wr32(mali + GPU_L2_PWROFF, l2);
++	printf("SWEET MALI: probe done, cores powered off\n");
++}
++
++void
++sweet_mali_probe(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	int enabled = 0;
++	thread_t thread;
++
++	if (mali_started) {
++		return;
++	}
++	mali_started = true;
++	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (enabled != 1) {
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/sweet-mali", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET MALI: no /sweet-mali node in the device tree\n");
++		return;
++	}
++	mali = ml_io_map(reg[0], reg[1]);
++	if (mali == 0) {
++		printf("SWEET MALI: MMIO mapping failed\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(mali_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET MALI: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 7ca1f28..d45eac9 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -57,6 +57,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_gpio_keys_init(void);
+ extern void sweet_ist_touch_init(void);
++extern void sweet_mali_probe(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+@@ -1404,6 +1405,7 @@ sweet_ufs_init(void)
+ 		 */
+ 		sweet_gpio_keys_init();
+ 		sweet_ist_touch_init();
++		sweet_mali_probe();             /* only with sweetgpu=1 */
+ 		printf("SWEET MMC: USB skipped\n");
+ 		return 0;
+ 	}
