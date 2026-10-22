@@ -2,7 +2,7 @@
 """Symbolicate shared-cache addresses from SWEET logs without the ipsw tool.
 
   dsc-sym.py CACHE_DIR SLIDE ADDR...        addresses as printed (slid)
-  dsc-sym.py CACHE_DIR SLIDE - < log        every 0x1... address on 'SMP'/'CRASH' lines
+  dsc-sym.py CACHE_DIR SLIDE - < log        every 0x1.../0x2... address on 'SMP'/'CRASH' lines
 
 CACHE_DIR holds dyld_shared_cache_arm64 and its subcaches (.01 ... .NN,
 .dylddata, .dyldlinkedit, .symbols), e.g. the SystemOS cryptex mounted with
@@ -193,7 +193,7 @@ def main():
             if not line.startswith(('SMP', 'CRASH')):
                 continue
             print(line.rstrip())
-            for a in re.findall(r'0x1[0-9a-f]{8}\b', line):
+            for a in re.findall(r'0x[12][0-9a-f]{8}\b', line):
                 r = s.lookup(int(a, 16) - slide)
                 if r:
                     print(f'    {a}  {r}')
